@@ -87,6 +87,14 @@ export function target(overrides: Partial<GitOpsTargetProjection> = {}): GitOpsT
     runtime: { status: 'synced_and_healthy' },
     health: { status: 'not_applicable' },
     lkg: { status: 'none' },
+    healthGate: {
+      policy: null,
+      configuredPolicy: 'observe',
+      awaitingRunId: null,
+      attempts: 0,
+      stopReason: null,
+      recoveryAvailable: false,
+    },
     tombstoned: false,
     ...overrides,
   };
