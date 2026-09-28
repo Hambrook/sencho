@@ -2017,6 +2017,8 @@ stacksRouter.post('/:stackName/down', async (req: Request, res: Response) => {
     if (isDebugEnabled()) console.debug(`[Stacks:debug] Down starting`, { stackName: sanitizeForLog(stackName), nodeId: req.nodeId, removeVolumes });
     await ComposeService.getInstance(req.nodeId).runDown(stackName, { removeVolumes }, getTerminalWs(req.get(DEPLOY_SESSION_HEADER)));
     invalidateNodeCaches(req.nodeId);
+    // runDown ends the gates it invalidated, so a gate on a stack the operator
+    // just took down cannot report the removal as a failed update.
     dlog(`[Stacks] Down completed: ${sanitizeForLog(stackName)}`);
     notifyActionSuccess(
       'stack_taken_down',
@@ -2041,6 +2043,18 @@ stacksRouter.post('/:stackName/down', async (req: Request, res: Response) => {
     StackOpMetricsService.getInstance().record(req.nodeId, 'down', Date.now() - t0, ok);
   }
 });
+
+/**
+ * Retire the stack's per-service recovery snapshots after a generation rollback
+ * replaced its runtime through its own compose up. The gates are ended before the
+ * restore runs, not here: the restore arms its own recovery observation, and
+ * ending the gates afterwards would end that one too. The backup-based rollback
+ * path gets both from `deployStack`.
+ */
+async function retireRollbackServiceRecoveries(nodeId: number, stackName: string): Promise<void> {
+  const { ServiceUpdateRecoveryService } = await import('../services/ServiceUpdateRecoveryService');
+  ServiceUpdateRecoveryService.getInstance().invalidateActiveForStack(nodeId, stackName);
+}
 
 export type StackContainerAction = 'restart' | 'stop' | 'start';
 
@@ -2087,6 +2101,18 @@ export async function containerActionForStack(
     const dockerController = DockerController.getInstance(nodeId);
     const containers = await dockerController.getContainersByStack(stackName);
     if (!containers || containers.length === 0) return { kind: 'no-containers' };
+    // Before the op, and here rather than in each caller, because this is the one
+    // function every stack-scoped container op runs through (the single-stack
+    // route, the bulk route, and the fleet label stop). A stop runs containers
+    // concurrently against a 10s Docker timeout, and a gate poll landing in that
+    // window would record the deliberate stop as a failed update.
+    if (action !== 'start') {
+      HealthGateService.getInstance().supersedeForContainerOp(
+        nodeId,
+        stackName,
+        `the stack was ${action === 'stop' ? 'stopped' : 'restarted'} during the observation`,
+      );
+    }
     const op =
       action === 'restart' ? (id: string) => dockerController.restartContainer(id)
         : action === 'stop' ? (id: string) => dockerController.stopContainer(id)
@@ -2183,6 +2209,20 @@ async function handleServiceAction(
     if (matching.length === 0) {
       res.status(404).json({ error: `Service '${serviceName}' not found in stack '${stackName}'.` });
       return;
+    }
+    // Before the op, for the same reason as the stack-level op: a stop runs
+    // containers against a 10s Docker timeout, and a gate poll landing in that
+    // window would record the deliberate stop as a failed update. Scoped to
+    // this service: its own gate and the stack gate end, while a sibling's gate
+    // keeps observing its own runtime with this service detached from the
+    // collateral set it would otherwise fail on.
+    if (action !== 'start') {
+      HealthGateService.getInstance().supersedeForContainerOp(
+        req.nodeId,
+        stackName,
+        `the service ${serviceName} was ${action === 'stop' ? 'stopped' : 'restarted'} during the observation`,
+        [serviceName],
+      );
     }
     const op =
       action === 'start'
@@ -2411,6 +2451,48 @@ stacksRouter.get('/:stackName/services/:serviceName/recovery', async (req: Reque
   }
 });
 
+/** Active stack recoveries with health-gate status, for overlapping service-update Restore resurfacing. */
+stacksRouter.get('/:stackName/recoveries', async (req: Request, res: Response) => {
+  const stackName = req.params.stackName as string;
+  if (!requirePermission(req, res, 'stack:deploy', 'stack', stackName)) return;
+  if (!(await requireStackExists(req.nodeId, stackName, res))) return;
+  if (!requireServiceScopedUpdateCapability(res)) return;
+  try {
+    const rows = ServiceUpdateRecoveryService.getInstance().listAllActiveForStack(req.nodeId, stackName);
+    const recoveries = rows.map(row => {
+      if (!row.health_gate_id) {
+        return {
+          serviceName: row.service_name,
+          recoveryId: row.id,
+          healthGateId: null,
+          healthGateStatus: 'unknown' as const,
+          healthGateReason: 'no health gate linked',
+          healthGateFailureSource: null,
+          expiresAt: row.expires_at,
+        };
+      }
+      const report = HealthGateService.getInstance().getReport(req.nodeId, stackName, row.health_gate_id);
+      return {
+        serviceName: row.service_name,
+        recoveryId: row.id,
+        healthGateId: row.health_gate_id,
+        healthGateStatus: (report.status === 'never-run' || !report.id) ? 'unknown' : report.status,
+        healthGateReason: report.reason ?? null,
+        healthGateFailureSource: report.failureSource,
+        expiresAt: row.expires_at,
+      };
+    });
+    res.json(recoveries);
+  } catch (error: unknown) {
+    console.error(
+      '[Stacks] Failed to list stack recoveries for %s: %s',
+      sanitizeForLog(stackName),
+      sanitizeForLog(getErrorMessage(error, 'unknown')),
+    );
+    res.status(500).json({ error: 'Failed to load stack recoveries', code: 'stack_recovery_lookup_failed' });
+  }
+});
+
 stacksRouter.post('/:stackName/services/:serviceName/restore', async (req: Request, res: Response) => {
   const recoveryId = typeof req.body?.recoveryId === 'string' ? req.body.recoveryId : '';
   if (!recoveryId) {
@@ -2635,15 +2717,30 @@ stacksRouter.post('/:stackName/rollback', async (req: Request, res: Response) =>
       try {
         const rolledBack = await recoverySvc.compensateWithCandidate(
           currentGen.id,
-          // Returns the Compose result rather than swallowing it, so a proven
-          // restore can bind its deployed pointer and open a health run.
-          (overridePath, invocation, overlay) => ComposeService.getInstance(req.nodeId).composeUpWithRecoveryOverride(
-            stackName,
-            overridePath,
-            getTerminalWs(req.get(DEPLOY_SESSION_HEADER)),
-            invocation,
-            overlay,
-          ),
+          // Ends the gates the restore is about to invalidate, and returns the
+          // Compose result rather than swallowing it, so a proven restore can
+          // bind its deployed pointer and open a health run.
+          //
+          // The supersede is in here rather than around the call for two reasons.
+          // The restore can refuse first, on integrity, policy or missing held
+          // references, and a refusal changes nothing, so it must not cost a live
+          // gate. And once the restore lands it arms its own recovery
+          // observation, so ending the gates after it would end that one too and
+          // the rollback could never be verified healthy.
+          (overridePath, invocation, overlay) => {
+            HealthGateService.getInstance().supersedeForContainerOp(
+              req.nodeId,
+              stackName,
+              'the stack was rolled back during the observation',
+            );
+            return ComposeService.getInstance(req.nodeId).composeUpWithRecoveryOverride(
+              stackName,
+              overridePath,
+              getTerminalWs(req.get(DEPLOY_SESSION_HEADER)),
+              invocation,
+              overlay,
+            );
+          },
           buildPolicyGateOptions(req, { actor: req.user?.username ?? 'system' }),
         );
         if (!rolledBack) {
@@ -2669,6 +2766,12 @@ stacksRouter.post('/:stackName/rollback', async (req: Request, res: Response) =>
           return;
         }
         if (compCode === 'RECOVERY_PROBE_FAILED') {
+          // The restore itself completed; only the probe after it failed, so the
+          // runtime really was replaced and this stack is settled like the
+          // success path below. The gates were already ended by the restore
+          // itself. ROLLBACK_PROHIBITED and HELD_IMAGE_MISSING do not reach this
+          // point with a replaced runtime, so they skip it.
+          await retireRollbackServiceRecoveries(req.nodeId, stackName);
           res.status(500).json({
             error: 'Rollback restore completed but recovery probe failed.',
             code: 'RECOVERY_PROBE_FAILED',
@@ -2679,6 +2782,12 @@ stacksRouter.post('/:stackName/rollback', async (req: Request, res: Response) =>
         throw compError;
       }
       invalidateNodeCaches(req.nodeId);
+      // The restore replaced every service's runtime, so the per-service snapshots
+      // taken before it are not rollback targets any more. The gates were already
+      // ended by the restore itself, just before its compose up. The backup-based
+      // rollback below gets both from `deployStack`.
+      const { ServiceUpdateRecoveryService } = await import('../services/ServiceUpdateRecoveryService');
+      ServiceUpdateRecoveryService.getInstance().invalidateActiveForStack(req.nodeId, stackName);
       dlog(`[Stacks] Rollback completed: ${sanitizeForLog(stackName)}`);
       // Echo the generation the point was bound to. A hub-driven rollout
       // rollback requires this to equal the generation it asked for, so a

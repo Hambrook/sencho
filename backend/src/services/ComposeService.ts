@@ -670,14 +670,59 @@ export class ComposeService {
 
   async runCommand(stackName: string, action: 'down' | 'start' | 'stop' | 'restart', ws?: WebSocket): Promise<void> {
     const stackDir = path.join(this.baseDir, stackName);
-    await this.execute('docker', await this.authoredComposeArgs(stackName, [action]), stackDir, ws);
+    // Resolve the arguments first: a stack whose compose cannot be resolved is
+    // refused before anything is touched, and must not cost a live gate.
+    const args = await this.authoredComposeArgs(stackName, [action]);
+    // Before the command, not after: compose stops containers one at a time
+    // against a 10s Docker stop timeout, and a gate poll landing in that window
+    // would record the deliberate stop as a failed update. `start` is excluded
+    // because it does not disturb the containers a gate is observing.
+    if (action !== 'start') {
+      await this.supersedeGatesForContainerOp(
+        stackName,
+        `the stack was ${action === 'down' ? 'taken down' : action === 'stop' ? 'stopped' : 'restarted'} during the observation`,
+      );
+    }
+    await this.execute('docker', args, stackDir, ws);
   }
 
   /** Interactive compose down (Take down UI / POST /down). Plain `down` by default. */
   async runDown(stackName: string, options?: { removeVolumes?: boolean }, ws?: WebSocket): Promise<void> {
     const stackDir = path.join(this.baseDir, stackName);
     const args = options?.removeVolumes ? ['down', '--volumes'] : ['down'];
-    await this.execute('docker', await this.authoredComposeArgs(stackName, args), stackDir, ws);
+    const composeArgs = await this.authoredComposeArgs(stackName, args);
+    await this.supersedeGatesForContainerOp(stackName, 'the stack was taken down during the observation');
+    await this.execute('docker', composeArgs, stackDir, ws);
+  }
+
+  /**
+   * End the gates that a compose run is about to invalidate, immediately before
+   * the compose command starts, so no gate poll can read the replaced containers
+   * first and report the operation as a failed update. Covers both a deliberate
+   * container action (the run commands and the take-downs below) and a
+   * stack-scoped deploy or update: from a gate's point of view those are the same
+   * event, the runtime it observes is about to be replaced. Awaited dynamic
+   * import: HealthGateService imports this module, so a static import would be a
+   * cycle.
+   *
+   * Every caller resolves its compose arguments, and a deploy resolves its
+   * registry auth, before getting here, so a run refused at that stage costs no
+   * live gate. Ending a gate that the compose run then fails to perform is the
+   * honest direction: the verdict is `unknown` with the attempted operation
+   * named, never a failure. Callers that open a replacement gate supersede the
+   * same gates again a moment later, so this is a harmless no-op for them.
+   */
+  private async supersedeGatesForContainerOp(stackName: string, reason: string): Promise<void> {
+    try {
+      const { HealthGateService } = await import('./HealthGateService');
+      HealthGateService.getInstance().supersedeForContainerOp(this.nodeId, stackName, reason);
+    } catch (error) {
+      console.error(
+        '[ComposeService] Failed to end health gate observations for %s:',
+        sanitizeForLog(stackName),
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   /**
@@ -976,6 +1021,34 @@ export class ComposeService {
     }
   }
 
+  /**
+   * Retire the stack's per-service recovery snapshots after a successful
+   * stack-scoped deploy or update replaced its runtime. Those snapshots point at
+   * images the stack is no longer running, so offering one would be a rollback
+   * behind the deploy the operator just ran.
+   *
+   * Deliberately after the compose up and only on success: a run that failed
+   * before handing off left the previous workload provably intact, and its
+   * snapshots still describe what is running.
+   *
+   * Best effort by design: the deploy already succeeded and its own evidence is
+   * recorded, so failing it over an offer the operator can decline would be the
+   * worse outcome. Dynamic import for the same reason as above: this module and
+   * the recovery services form an import cycle.
+   */
+  private async retireStaleServiceRecoveries(stackName: string): Promise<void> {
+    try {
+      const { ServiceUpdateRecoveryService } = await import('./ServiceUpdateRecoveryService');
+      ServiceUpdateRecoveryService.getInstance().invalidateActiveForStack(this.nodeId, stackName);
+    } catch (error) {
+      console.error(
+        '[ComposeService] Failed to retire stale service recovery records for %s:',
+        sanitizeForLog(stackName),
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   async deployStack(
     stackName: string,
     ws?: WebSocket,
@@ -1067,6 +1140,13 @@ export class ComposeService {
           } else {
             args = await this.authoredComposeArgs(stackName, upAction, stackDir);
           }
+          // End the gates from any earlier run here, after the arguments and the
+          // registry auth have resolved and immediately before the compose up
+          // replaces the containers they are observing, so neither a refused
+          // deploy nor a poll in the compose up's own seconds costs a live gate.
+          // The snapshots are retired further down, once this has provably
+          // succeeded.
+          await this.supersedeGatesForContainerOp(stackName, 'the stack was redeployed during the observation');
           composeHandedOff = true;
           await this.execute('docker', args, stackDir, ws, true, env, getComposeStallTimeoutMs());
         } finally {
@@ -1105,6 +1185,12 @@ export class ComposeService {
           );
         }
       }
+      // The deploy replaced every service's image, so the per-service snapshots
+      // taken before it stop being rollback targets. This is the one commit every
+      // deploy path (route, template, webhook, scheduler, mesh, blueprint, Git
+      // apply) passes through. A stack rollback runs its own compose up, so the
+      // route settles it there.
+      await this.retireStaleServiceRecoveries(stackName);
       if (debug) console.debug(`[ComposeService:debug] deployStack completed in ${Date.now() - t0}ms`, { stackName });
       gitopsDeploy?.bound();
     } catch (deployError) {
@@ -1630,6 +1716,11 @@ export class ComposeService {
       await this.withRegistryAuth(async (env) => {
         sendOutput('=== Recreating containers ===\n');
         const args = await this.authoredComposeArgs(stackName, ['up', '-d', '--remove-orphans']);
+        // End the gates from any earlier run here, for the same reason as the
+        // deploy path: after the arguments and the registry auth have resolved,
+        // and immediately before the compose up replaces the containers they are
+        // observing.
+        await this.supersedeGatesForContainerOp(stackName, 'the stack was updated during the observation');
         // Set only once Compose is genuinely about to receive the mutation:
         // reading compose args or resolving registry auth can still fail with
         // the previous workload provably intact.
@@ -1662,6 +1753,11 @@ export class ComposeService {
           sanitizeForLog(candidate.id),
         );
       }
+
+      // The update replaced every service's image, so the per-service snapshots
+      // taken before it stop being rollback targets. With the same step on the
+      // deploy path, this is the one place a stack runtime change retires them.
+      await this.retireStaleServiceRecoveries(stackName);
 
       sendOutput('=== Stack updated successfully ===\n');
 
@@ -1864,6 +1960,10 @@ export class ComposeService {
       const args = options?.removeVolumes
         ? ['down', '--volumes', '--remove-orphans']
         : ['down', '--remove-orphans'];
+      // Teardown removes the containers a gate would be observing (stack deletion,
+      // and the rollback down of a failed template deploy), so it ends the gates
+      // first, for the same reason runDown does.
+      await this.supersedeGatesForContainerOp(stackName, 'the stack was torn down during the observation');
       await this.execute('docker', await this.authoredComposeArgs(stackName, args), stackPath, undefined, false);
     } catch (error) {
       console.warn(`[Teardown] Docker down failed or nothing to clean up for ${sanitizeForLog(stackName)}`);

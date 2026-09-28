@@ -504,6 +504,42 @@ describe('HealthGateService verdicts', () => {
   });
 });
 
+describe('HealthGateService container-op supersede', () => {
+  it('finalizes the gates on the stack as unknown when the stack is stopped', async () => {
+    const gate = svc().beginStack(0, 'web', 'update', 'tester', { deployedGenerationId: null })!;
+    await ticks(2);
+
+    expect(svc().supersedeForContainerOp(0, 'web', 'the stack was stopped during the observation')).toBe(1);
+    const report = svc().getReport(0, 'web', gate);
+    expect(report.status).toBe('unknown');
+    expect(report.reason).toContain('stopped');
+  });
+
+  it('leaves another stack observing', async () => {
+    const web = svc().beginStack(0, 'web', 'update', 'tester', { deployedGenerationId: null })!;
+    const api = svc().beginStack(0, 'api', 'update', 'tester', { deployedGenerationId: null })!;
+    await ticks(2);
+
+    svc().supersedeForContainerOp(0, 'web', 'the stack was taken down during the observation');
+    expect(svc().getReport(0, 'web', web).status).toBe('unknown');
+    expect(svc().getReport(0, 'api', api).status).toBe('observing');
+  });
+
+  it('records the named reason on every gate it finalizes', async () => {
+    const stack = svc().beginStack(0, 'web', 'update', 'tester', { deployedGenerationId: null })!;
+    await ticks(2);
+
+    expect(svc().supersedeForContainerOp(0, 'web', 'the service app was stopped during the observation', ['app'])).toBe(1);
+    const report = svc().getReport(0, 'web', stack);
+    expect(report.status).toBe('unknown');
+    expect(report.reason).toBe('the service app was stopped during the observation');
+  });
+
+  it('reports nothing to supersede for a stack with no live gate', () => {
+    expect(svc().supersedeForContainerOp(0, 'quiet', 'the stack was stopped')).toBe(0);
+  });
+});
+
 describe('HealthGateService lifecycle', () => {
   it('never lets a poll that straddled a supersede overwrite the terminal verdict', async () => {
     // A poll is mid-await on Docker when a newer update supersedes the gate;
@@ -654,6 +690,26 @@ describe('HealthGateService recovery reservations', () => {
 
     expect(state.runs.get(older!)!.status).toBe('unknown');
     expect(state.runs.get(older!)!.reason).toContain('superseded');
+    await ticks(7);
+    expect(state.runs.get(runId!)!.status).toBe('passed');
+  });
+
+  it('leaves the recovery run a rollback arms observing, when the gates end first', async () => {
+    // A generation rollback ends the gates from earlier runs before it replaces
+    // the runtime, then arms its own recovery observation. Ending the gates
+    // after the restore instead would finalize that recovery run as unknown, and
+    // the rollback could never be verified healthy.
+    const older = svc().beginStack(0, 'web', 'update', 'tester', { deployedGenerationId: null });
+    await ticks(1);
+
+    svc().supersedeForContainerOp(0, 'web', 'the stack was rolled back during the observation');
+    expect(state.runs.get(older!)!.status).toBe('unknown');
+
+    const { runId } = reserve();
+    svc().armReservedRun(runId!, 0, 'web');
+    expect(state.runs.get(runId!)!.status).toBe('observing');
+    expect(state.runs.get(older!)!.status).toBe('unknown');
+
     await ticks(7);
     expect(state.runs.get(runId!)!.status).toBe('passed');
   });

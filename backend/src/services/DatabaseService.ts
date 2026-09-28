@@ -4607,6 +4607,48 @@ stmt.run('gitops_schema_version', '1');
         ).all(nodeId, stackName, serviceName) as ServiceUpdateRecoveryRow[];
     }
 
+    /**
+     * Active, unexpired rows for all services in a stack, most recent first.
+     * Only the newest usable row per service is returned: a superseded row (e.g.
+     * an older failed gate followed by a passing re-update) must never surface a
+     * Restore offer that would roll a healthy service back to a stale snapshot.
+     * "Usable" excludes an in-flight newer row too, since a restore already
+     * holding a live claim is mid-replacement: falling back to the older row
+     * while it runs would offer a second, stale rollback for the same service.
+     */
+    public listActiveServiceUpdateRecoveriesForStack(nodeId: number, stackName: string, now: number): ServiceUpdateRecoveryRow[] {
+        return this.db.prepare(
+            `SELECT r.* FROM service_update_recovery r
+             WHERE r.node_id = ? AND r.stack_name = ? AND r.status = 'active' AND r.expires_at > ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM service_update_recovery n
+                   WHERE n.node_id = r.node_id AND n.stack_name = r.stack_name AND n.service_name = r.service_name
+                     AND ((n.status = 'active' AND n.expires_at > ?)
+                          OR (n.status = 'restoring' AND n.claim_expires_at > ?))
+                     AND (n.created_at > r.created_at OR (n.created_at = r.created_at AND n.rowid > r.rowid))
+               )
+             ORDER BY r.created_at DESC`
+        ).all(nodeId, stackName, now, now, now) as ServiceUpdateRecoveryRow[];
+    }
+
+    /**
+     * Retire every active service recovery for a stack: a stack-scoped deploy or
+     * update replaced the runtime all of them point at, so none of them is a
+     * rollback target any more. Returns the number of rows retired.
+     *
+     * This is the whole point of a snapshot, so retiring is terminal and honest
+     * ('invalidated', the same state a mid-flight restore with a missing image
+     * lands in) rather than a hidden expiry. The rows stay for the audit trail;
+     * only their offer disappears.
+     */
+    public invalidateActiveServiceUpdateRecoveriesForStack(nodeId: number, stackName: string): number {
+        const result = this.db.prepare(
+            `UPDATE service_update_recovery SET status = 'invalidated'
+             WHERE node_id = ? AND stack_name = ? AND status = 'active'`
+        ).run(nodeId, stackName);
+        return result.changes;
+    }
+
     /** Attach the update flow's own health gate run id while the row is still active. */
     public linkServiceUpdateRecoveryHealthGate(id: string, healthGateId: string): void {
         this.db.prepare(
@@ -4685,12 +4727,24 @@ stmt.run('gitops_schema_version', '1');
         return result.changes;
     }
 
-    /** Image IDs currently protected from prune: active rows and restoring rows with a live claim. */
+    /**
+     * Image IDs currently protected from prune: active rows, restoring rows with
+     * a live claim, and retired rows until their own TTL expires.
+     *
+     * Retired (`invalidated`) rows still hold: a stack deploy or update retires
+     * the stack's snapshots without touching the images, and the prune that runs
+     * right behind an update would otherwise delete the only known-good image the
+     * stack was on. The hold is bounded by `expires_at`, the same TTL that bounds
+     * the offer, so it needs no sweeper of its own.
+     */
     public listHeldServiceUpdateRecoveryImageIds(nodeId: number, now: number): string[] {
         const rows = this.db.prepare(
             `SELECT DISTINCT majority_image_id FROM service_update_recovery
-             WHERE node_id = ? AND (status = 'active' OR (status = 'restoring' AND claim_expires_at > ?))`
-        ).all(nodeId, now) as Array<{ majority_image_id: string }>;
+             WHERE node_id = ?
+               AND (status = 'active'
+                    OR (status = 'restoring' AND claim_expires_at > ?)
+                    OR (status = 'invalidated' AND expires_at > ?))`
+        ).all(nodeId, now, now) as Array<{ majority_image_id: string }>;
         return rows.map(r => r.majority_image_id);
     }
 
