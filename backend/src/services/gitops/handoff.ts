@@ -247,6 +247,25 @@ function liveRolloutBinding(app: GitOpsApplicationRow): FutureRolloutAuthorizati
 }
 
 /**
+ * Whether any live target of this application has an operation in flight.
+ *
+ * Read from the target rows rather than from the application pointer, because a
+ * target can be mid-deploy while the application itself has nothing running: the
+ * two are separate machines and only the target knows about its own apply.
+ *
+ * Exported because the placement decision needs the same answer for the same
+ * reason. A sequential rollout sets its stage on the target, so a check that only
+ * reads the application pointer cannot see a rollout that is mid-deploy. An
+ * automatic placement approved during one clears the authorization and
+ * supersedes the generation that deploy is running under.
+ */
+export function hasTargetOperationInFlight(store: GitOpsStore, applicationId: string): boolean {
+  return store
+    .listTargets(applicationId)
+    .some((target) => target.target_status === 'active' && target.active_operation_stage !== null);
+}
+
+/**
  * Ensure a live rollout_authorization exists for the application, minting
  * one when every binding ingredient is present and registry preflight is ready.
  * Recomputes registry readiness on every call; remints when the fingerprint drifts.
@@ -277,6 +296,31 @@ export async function ensureRolloutAuthorization(
     }
     if (shouldAbort?.()) return { ok: false, reason: 'The rollout is paused.' };
 
+    // Whether authority already exists decides two gates below, because both of
+    // them govern whether authority may be *created*, not what may be executed
+    // with it. An operator who authorized a rollout and an operator who let a
+    // policy authorize one have both granted it; neither grant is withdrawn by a
+    // later configuration change, and neither should be re-litigated on every
+    // dispatch. Skipping the gates also keeps a routine background source fetch
+    // from pausing a rollout that is already authorized and running.
+    //
+    // The preflight evaluation and the drift remint still run either way, since
+    // that is this function's other job and it is about evidence rather than
+    // authority.
+    const alreadyAuthorized = liveRolloutBinding(app) !== null;
+
+    // A conflicting operation is a refusal, not a wait. The pause check above
+    // only knows about a deliberate pause, so without this an authorization
+    // could be minted while a fetch, apply, deploy, or recovery is still running
+    // for the application, and the two would then disagree about what the next
+    // operation acts on.
+    if (!alreadyAuthorized && app.active_operation_stage) {
+      return { ok: false, reason: 'An operation is already in flight for this application.' };
+    }
+    if (!alreadyAuthorized && hasTargetOperationInFlight(store, app.id)) {
+      return { ok: false, reason: 'An operation is already in flight for a rollout target.' };
+    }
+
     const ingredients = store.authorizationIngredients(app);
     if (!ingredients) {
       if (!app.placement_approval_ref) {
@@ -286,6 +330,29 @@ export async function ensureRolloutAuthorization(
         ok: false,
         reason: 'Source acceptance, artifact set, and placement must all be current before rollout authorization.',
       };
+    }
+
+    // Only now that the authorization ingredients are all in place is the policy
+    // question worth answering: the gate is "may policy authorize this, or must a
+    // human", and it has no meaning until there is something to authorize. Placed
+    // earlier it masked the prerequisite that was actually missing, reporting a
+    // policy statement where the actionable fact was an unapproved placement.
+    // It is also a question about minting only, so an authorization that already
+    // exists is not re-litigated against a policy that has since changed.
+    //
+    // The operator path is unaffected: an operator asking to authorize is itself
+    // the authority, and no policy stands in the way of one.
+    //
+    // Without this the column is write-only. An operator could set the policy to
+    // manual, get a success response and a history row, and then watch the next
+    // dispatch mint anyway, under a generation frozen with a policy that did not
+    // govern it.
+    if (
+      !alreadyAuthorized &&
+      authority === 'configured_policy' &&
+      app.rollout_authorization_policy !== 'automatic'
+    ) {
+      return { ok: false, reason: 'The rollout authorization policy requires an operator to authorize.' };
     }
 
     const artifactRefusal = executableArtifactRefusalReason(

@@ -5,6 +5,8 @@ import { Button } from '@/components/ui/button';
 import { toast } from '@/components/ui/toast-store';
 import { RolloutPreviewDialog } from '@/components/blueprints/RolloutPreviewDialog';
 import { acceptGitOpsSource, authorizeGitOpsRollout } from '@/lib/gitopsAuthorityApi';
+import { policyReadFor } from '@/lib/gitopsAuthorityPolicy';
+import GitOpsPolicyControl from '@/components/gitops/GitOpsPolicyControl';
 import { livePlacementFacet, liveSourceFacet } from '@/lib/gitopsState';
 import type { PermissionAction } from '@/context/AuthContext';
 import type { GitOpsRevisionProjection } from '@/types/gitops';
@@ -67,7 +69,13 @@ export default function GitOpsAuthorityActions({
   const [pending, setPending] = useState<PendingAction | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
 
-  const live = projection.targetMode === 'blueprint' ? projection : null;
+  // Both Blueprint modes count as a live application here, because both are
+  // placed. A Blueprint demoted back to Inline keeps its placement policy and the
+  // placement decision still evaluates it, so its policy needs a control; hiding
+  // the whole block on target mode left a demoted application with a live
+  // automatic decision and no way to reach it from the interface.
+  const isBlueprintTarget = projection.targetMode === 'blueprint' || projection.targetMode === 'inline_blueprint';
+  const live = isBlueprintTarget ? projection : null;
   const source = liveSourceFacet(projection);
   const placement = livePlacementFacet(projection);
 
@@ -77,22 +85,34 @@ export default function GitOpsAuthorityActions({
   const candidateGenerationId = source?.status === 'candidate_ready' || source?.status === 'source_review_pending'
     ? source.candidateGenerationId
     : null;
-  const canAcceptSource = !!live
+  // Each of these acts on a Git source generation, which an Inline Blueprint
+  // does not have, and the routes behind them refuse anything but a Git-managed
+  // application. Offering one would be a button whose every press is a 409.
+  const canAcceptSource = projection.targetMode === 'blueprint'
     && candidateGenerationId !== null
     && allowed('stack:create');
 
-  const canApprovePlacement = !!live
+  const canApprovePlacement = projection.targetMode === 'blueprint'
     && blueprintId !== null
     && placement?.status === 'placement_review_pending'
     && allowed('stack:create') && allowed('stack:deploy');
 
-  const canAuthorizeRollout = !!live
+  const canAuthorizeRollout = projection.targetMode === 'blueprint'
     && (placement?.status === 'rollout_authorization_pending'
       || placement?.status === 'rollout_authorization_stale'
       || placement?.status === 'preflight_blocked')
     && allowed('stack:deploy');
 
-  if (!canAcceptSource && !canApprovePlacement && !canAuthorizeRollout) return null;
+  // The placement policy is configurable whether or not a placement is waiting,
+  // so the row cannot be gated on an outstanding action the way the three action
+  // buttons are. Without this the control would only exist at the moment it is
+  // least needed, which is exactly when an operator is deciding what to do.
+  const placementPolicyRead = policyReadFor(live?.authorityPolicies, 'placement');
+  const canConfigurePlacement = !!live && allowed('stack:deploy');
+
+  if (!canAcceptSource && !canApprovePlacement && !canAuthorizeRollout && !canConfigurePlacement) {
+    return null;
+  }
 
   async function handleAcceptSource(): Promise<void> {
     if (!candidateGenerationId) return;
@@ -175,6 +195,28 @@ export default function GitOpsAuthorityActions({
             <ShieldCheck className="h-3.5 w-3.5" strokeWidth={1.5} />
             {pending === 'rollout' ? 'Authorizing…' : 'Authorize rollout'}
           </Button>
+        )}
+        {placementPolicyRead && canConfigurePlacement && (
+          // Beside the placement approval, because that is the decision this
+          // policy governs. Same gate as the approval it configures, so a
+          // session that cannot deploy is not offered either.
+          <GitOpsPolicyControl
+            applicationId={applicationId}
+            domain="placement"
+            read={placementPolicyRead}
+            onChanged={onChanged}
+            canWrite={canConfigurePlacement}
+            trigger={(open) => (
+              <button
+                type="button"
+                onClick={open}
+                className="ml-auto font-mono text-[10px] uppercase tracking-[0.18em] text-stat-subtitle transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/50 max-md:min-h-11"
+                data-testid="gitops-action-placement-policy"
+              >
+                Placement policy
+              </button>
+            )}
+          />
         )}
       </div>
 

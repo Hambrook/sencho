@@ -112,6 +112,43 @@ CREATE TABLE IF NOT EXISTS gitops_applications (
   source_policy TEXT NOT NULL DEFAULT 'manual' CHECK (
     source_policy IN ('manual','review','automatic')
   ),
+  -- Placement policy, independent of source policy. operator is the only safe
+  -- default: automatic placement moves workloads on nodes, and an install that
+  -- has never asked to be automated must not start.
+  placement_policy TEXT NOT NULL DEFAULT 'operator' CHECK (
+    placement_policy IN ('operator','bounded_auto')
+  ),
+  -- Whether rollout authorization is minted by policy or waits for an operator.
+  -- New installs wait, because an install with no rollout history has no
+  -- evidence that any target can take the generation. Existing installations
+  -- are a separate case, handled by the one-time backfill in the migration,
+  -- because they already authorized themselves.
+  rollout_authorization_policy TEXT NOT NULL DEFAULT 'manual' CHECK (
+    rollout_authorization_policy IN ('manual','automatic')
+  ),
+  -- Why bounded automatic placement last declined, and when. Null when no
+  -- bounded-auto evaluation has declined, which is the common case and includes
+  -- every application still on the operator policy.
+  --
+  -- Recorded because the decision is otherwise invisible once the producer
+  -- returns. A placement left waiting for review under an automatic policy with
+  -- no stated reason is indistinguishable from a policy that does nothing, and
+  -- that is exactly how an automatic path reads when it is broken.
+  --
+  -- The vocabulary is the closed decision vocabulary and not a free string, so
+  -- a reason that no decision can produce cannot be stored or projected. Cleared
+  -- when the review is resolved, and when the policy changes, because a reason
+  -- that described the old policy describes nothing now.
+  placement_policy_refusal_reason TEXT NULL CHECK (
+    placement_policy_refusal_reason IS NULL OR placement_policy_refusal_reason IN (
+      'policy_is_operator','no_placement_change','stateless_addition','stateless_removal',
+      'mixed_add_and_remove','multiple_additions','multiple_removals','stateful_workload',
+      'unknown_workload','first_multi_node_placement','pin_driven_placement','cordon_override','cordon_driven_removal',
+      'stale_node','unknown_connectivity','missing_evidence','malformed_evidence',
+      'destructive_effect','conflicting_operation'
+    )
+  ),
+  placement_policy_refused_at INTEGER NULL,
   poll_interval_secs INTEGER NULL,
   next_poll_at INTEGER NULL,
   attempt_seq INTEGER NOT NULL DEFAULT 0,
@@ -302,6 +339,12 @@ CREATE TABLE IF NOT EXISTS gitops_rollout_generations (
   preflight_fingerprint TEXT NULL,
   preflight_evidence_json TEXT NULL,
   rollout_strategy_json TEXT NOT NULL DEFAULT '{}',
+  -- The policy snapshot this generation executes, frozen at the moment the
+  -- generation opened. Nullable with no default on purpose: a row that predates
+  -- the column is SQL NULL, which the decoder reconstructs as the legacy
+  -- behavior those rollouts actually had. An empty-object default would make
+  -- absence impossible and turn every existing generation into a decode failure.
+  policy_snapshot_json TEXT NULL,
   provenance TEXT NOT NULL CHECK (provenance IN (
     'legacy_inline','placement_approval','rollout_authorization'
   )),

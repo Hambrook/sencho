@@ -18,6 +18,7 @@ import { GitOpsTransitions } from '../services/gitops/transitions';
 import { candidateRelPathForSha, stagingMarkerPath } from '../services/gitops/createStagingMarker';
 import { stackManagedRoot } from '../services/gitops/directApplication';
 import type { GitOpsApplicationRow, GitOpsCreateCheckpointRow } from '../services/gitops/types';
+import { DEFAULT_PLACEMENT_POLICY, DEFAULT_ROLLOUT_AUTHORIZATION_POLICY } from '../services/gitops/policyComposition';
 
 const SHA = 'beef5678';
 
@@ -171,6 +172,10 @@ function creatingApp(id: string, stackName: string): GitOpsApplicationRow {
     pause_reason: null,
     source_suspended_reason: null,
     source_policy: 'manual',
+    placement_policy: DEFAULT_PLACEMENT_POLICY,
+    rollout_authorization_policy: DEFAULT_ROLLOUT_AUTHORIZATION_POLICY,
+        placement_policy_refusal_reason: null,
+        placement_policy_refused_at: null,
     poll_interval_secs: null,
     next_poll_at: null,
     attempt_seq: 0,

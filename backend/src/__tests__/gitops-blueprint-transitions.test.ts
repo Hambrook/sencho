@@ -20,6 +20,7 @@ import type {
   GitOpsIntentRevisionRow,
   GitOpsRolloutCandidateRow,
 } from '../services/gitops/types';
+import { DEFAULT_PLACEMENT_POLICY, DEFAULT_ROLLOUT_AUTHORIZATION_POLICY } from '../services/gitops/policyComposition';
 
 describe('gitops blueprint transitions', () => {
   let tmpDir: string;
@@ -788,6 +789,10 @@ function inlineApp(id: string, blueprintId: number): GitOpsApplicationRow {
     pause_reason: null,
     source_suspended_reason: null,
     source_policy: 'manual',
+    placement_policy: DEFAULT_PLACEMENT_POLICY,
+    rollout_authorization_policy: DEFAULT_ROLLOUT_AUTHORIZATION_POLICY,
+        placement_policy_refusal_reason: null,
+        placement_policy_refused_at: null,
     poll_interval_secs: null,
     next_poll_at: null,
     attempt_seq: 0,

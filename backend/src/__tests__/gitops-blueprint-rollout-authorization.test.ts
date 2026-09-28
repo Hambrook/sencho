@@ -655,6 +655,212 @@ describe('ensureRolloutAuthorization', () => {
     expect(() => authorize(fixture.applicationId)).toThrow(/already live/);
     expect(GitOpsStore.getInstance().getApplication(fixture.applicationId)!.rollout_authorization_ref).toBe(ref);
   });
+
+  it('refuses any policy-authorized mint that reaches the transition on a manual policy', () => {
+    // The regression this pins, asserted where the guarantee now lives.
+    //
+    // A drifted authorization is discarded and reminted through this same
+    // transition, as is the race-retry path and every other caller: the
+    // acceptance handoff, the Blueprint dispatch, the startup reconstruction, the
+    // preflight backfill and the operator route. Gating on whether a binding
+    // happened to exist, in one caller, left the remint path minting fresh
+    // authority with no operator on a manual policy. Enforcing it in the single
+    // writer is what makes it unbypassable, and this asserts exactly that.
+    const fixture = seedAuthorizedReadyApp();
+    const store = GitOpsStore.getInstance();
+    const app = store.getApplication(fixture.applicationId)!;
+    const preflight = nonBlockingPreflightForApp(fixture.applicationId);
+
+    GitOpsTransitions.getInstance().rolloutAuthorizationPolicyChanged({
+      applicationId: fixture.applicationId,
+      policy: 'manual',
+      envelope: { operationId: 'op-mint-gate', actor: 'tester', trigger: 'test', at: Date.now() },
+    });
+
+    expect(() =>
+      GitOpsTransitions.getInstance().rolloutAuthorized({
+        applicationId: fixture.applicationId,
+        approvalId: 'mint-manual',
+        rolloutGenerationId: 'rgen-manual',
+        preflightFingerprint: fingerprintPreflightEvidence(preflight),
+        preflightEvidenceJson: encodePreflightEvidenceJson(preflight),
+        actor: null,
+        envelope: { operationId: 'op-mint-gate', actor: null, trigger: 'placement', at: 1 },
+        authority: 'configured_policy',
+      }),
+    ).toThrow(/requires an operator/);
+
+    // The operator path is unaffected: an operator is themselves the authority.
+    expect(() =>
+      GitOpsTransitions.getInstance().rolloutAuthorized({
+        applicationId: fixture.applicationId,
+        approvalId: 'mint-operator',
+        rolloutGenerationId: 'rgen-operator',
+        preflightFingerprint: fingerprintPreflightEvidence(preflight),
+        preflightEvidenceJson: encodePreflightEvidenceJson(preflight),
+        actor: 'tester',
+        envelope: { operationId: 'op-mint-operator', actor: 'tester', trigger: 'manual', at: 1 },
+        authority: 'operator',
+      }),
+    ).not.toThrow();
+    void app;
+  });
+
+  it('refuses a policy-authorized mint that reaches the transition mid-operation', () => {
+    // The same guarantee for the in-flight guard, on the remint path.
+    const fixture = seedAuthorizedReadyApp();
+    const preflight = nonBlockingPreflightForApp(fixture.applicationId);
+    DatabaseService.getInstance().getDb()
+      .prepare("UPDATE gitops_applications SET active_operation_stage = 'deploy_started', active_operation_id = 'op-x' WHERE id = ?")
+      .run(fixture.applicationId);
+
+    expect(() =>
+      GitOpsTransitions.getInstance().rolloutAuthorized({
+        applicationId: fixture.applicationId,
+        approvalId: 'mint-busy',
+        rolloutGenerationId: 'rgen-busy',
+        preflightFingerprint: fingerprintPreflightEvidence(preflight),
+        preflightEvidenceJson: encodePreflightEvidenceJson(preflight),
+        actor: null,
+        envelope: { operationId: 'op-mint-busy', actor: null, trigger: 'preflight_race', at: 1 },
+        authority: 'configured_policy',
+      }),
+    ).toThrow(/already in flight/);
+  });
+
+  it('keeps dispatching an authorized rollout while a source operation is in flight', async () => {
+    // A routine background source fetch must not pause a rollout that is already
+    // authorized and running. The in-flight guard is about whether authority may
+    // be minted, and this authority already exists.
+    const fixture = seedAuthorizedReadyApp();
+    const store = GitOpsStore.getInstance();
+    await ensureRolloutAuthorization(fixture.applicationId, 'tester');
+    expect(store.getApplication(fixture.applicationId)!.rollout_authorization_ref).toBeTruthy();
+
+    const db = DatabaseService.getInstance().getDb();
+    db.prepare("UPDATE gitops_applications SET active_operation_stage = 'fetch_started', active_operation_id = 'op-bg' WHERE id = ?")
+      .run(fixture.applicationId);
+
+    expect((await ensureRolloutAuthorization(fixture.applicationId, 'tester')).ok).toBe(true);
+
+    // The same holds for a target, which can be mid-apply while the application
+    // itself has nothing running.
+    db.prepare("UPDATE gitops_applications SET active_operation_stage = NULL WHERE id = ?")
+      .run(fixture.applicationId);
+    db.prepare(
+      `INSERT INTO gitops_target_current (application_id, node_id, target_status, connectivity, latest_stage, active_operation_id, active_operation_stage, updated_at)
+       VALUES (?, ?, 'active', 'reachable', 'blueprint_ack_recorded', 'op-t', 'deploy_started', ?)
+       ON CONFLICT(application_id, node_id) DO UPDATE SET active_operation_stage = 'deploy_started', active_operation_id = 'op-t'`,
+    ).run(fixture.applicationId, fixture.nodeId, Date.now());
+
+    expect((await ensureRolloutAuthorization(fixture.applicationId, 'tester')).ok).toBe(true);
+  });
+
+  it('lets an operator-authorized rollout dispatch on the default manual policy', async () => {
+    // The regression this pins. An operator authorizes, which succeeds because
+    // the operator is the authority, and the dispatch that follows re-enters this
+    // function on the automatic path. With the policy at its fresh-install
+    // default of manual, the gate used to refuse there, so the operator was told
+    // it worked and nothing deployed.
+    const fixture = seedAuthorizedReadyApp();
+    const store = GitOpsStore.getInstance();
+    GitOpsTransitions.getInstance().rolloutAuthorizationPolicyChanged({
+      applicationId: fixture.applicationId,
+      policy: 'manual',
+      envelope: { operationId: 'op-manual-2', actor: 'tester', trigger: 'test', at: Date.now() },
+    });
+
+    // Minted by the operator.
+    const byOperator = await ensureRolloutAuthorization(
+      fixture.applicationId, 'tester', 'manual', undefined, 'operator',
+    );
+    expect(byOperator.ok).toBe(true);
+    expect(store.getApplication(fixture.applicationId)!.rollout_authorization_ref).toBeTruthy();
+
+    // The dispatch that follows asks again as the automatic path, and must be
+    // answered from the authority that already exists rather than re-decided.
+    const onDispatch = await ensureRolloutAuthorization(fixture.applicationId, 'tester');
+    expect(onDispatch.ok).toBe(true);
+  });
+
+  it('still refuses a policy-authorized mint on a manual policy with nothing granted', async () => {
+    // The gate keeps its teeth for the case it exists for: no authority exists,
+    // so policy is the only thing that could grant it, and it does not.
+    const fixture = seedAuthorizedReadyApp();
+    GitOpsTransitions.getInstance().rolloutAuthorizationPolicyChanged({
+      applicationId: fixture.applicationId,
+      policy: 'manual',
+      envelope: { operationId: 'op-manual-3', actor: 'tester', trigger: 'test', at: Date.now() },
+    });
+    // Undo the operator mint by clearing the live authorization for this check.
+    DatabaseService.getInstance().getDb()
+      .prepare('UPDATE gitops_applications SET rollout_authorization_ref = NULL WHERE id = ?')
+      .run(fixture.applicationId);
+
+    const result = await ensureRolloutAuthorization(fixture.applicationId, 'tester');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/requires an operator/);
+  });
+
+  it('refuses a policy-authorized mint when the policy says an operator authorizes', async () => {
+    // The policy is only real if something reads it. Without this gate an
+    // operator could set the policy to manual, get a success response and a
+    // history row, and then watch the next dispatch mint anyway under a
+    // generation frozen with a policy that never governed it.
+    const fixture = seedAuthorizedReadyApp();
+    const store = GitOpsStore.getInstance();
+    GitOpsTransitions.getInstance().rolloutAuthorizationPolicyChanged({
+      applicationId: fixture.applicationId,
+      policy: 'manual',
+      envelope: { operationId: 'op-manual', actor: 'tester', trigger: 'test', at: Date.now() },
+    });
+
+    const automatic = await ensureRolloutAuthorization(fixture.applicationId, 'tester');
+    expect(automatic.ok).toBe(false);
+    if (!automatic.ok) expect(automatic.reason).toMatch(/requires an operator/);
+    expect(store.getApplication(fixture.applicationId)!.rollout_authorization_ref).toBeNull();
+
+    // An operator authorizing by hand is itself the authority, so the policy
+    // does not stand in their way.
+    const byOperator = await ensureRolloutAuthorization(fixture.applicationId, 'tester', 'manual', undefined, 'operator');
+    expect(byOperator.ok).toBe(true);
+  });
+
+  it('refuses while an operation is in flight for the application', async () => {    // The pause check only knows about a deliberate pause. Without this guard an
+    // authorization could be minted while a fetch, apply, deploy, or recovery
+    // was still running, and the two would disagree about what the next
+    // operation acts on.
+    const fixture = seedAuthorizedReadyApp();
+    const store = GitOpsStore.getInstance();
+    // Set directly: the pointer writer only covers a subset of the row, and an
+    // in-flight operation is normally opened by the operation transitions.
+    DatabaseService.getInstance().getDb()
+      .prepare("UPDATE gitops_applications SET active_operation_stage = 'deploy_started', active_operation_id = ? WHERE id = ?")
+      .run('op-x', fixture.applicationId);
+
+    const result = await ensureRolloutAuthorization(fixture.applicationId, 'tester');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/already in flight/);
+    expect(store.getApplication(fixture.applicationId)!.rollout_authorization_ref).toBeNull();
+  });
+
+  it('refuses while a rollout target has an operation in flight', async () => {
+    // A target can be mid-apply while the application itself has nothing
+    // running, so the guard reads the target rows rather than the application
+    // pointer alone.
+    const fixture = seedAuthorizedReadyApp();
+    const store = GitOpsStore.getInstance();
+    const target = store.getTarget(fixture.applicationId, fixture.nodeId)!;
+    void target;
+    DatabaseService.getInstance().getDb()
+      .prepare("UPDATE gitops_target_current SET active_operation_stage = 'deploy_started', active_operation_id = ? WHERE application_id = ? AND node_id = ?")
+      .run('op-y', fixture.applicationId, fixture.nodeId);
+
+    const result = await ensureRolloutAuthorization(fixture.applicationId, 'tester');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/already in flight/);
+    expect(store.getApplication(fixture.applicationId)!.rollout_authorization_ref).toBeNull();
+  });
 });
 
 describe('backfillMissingPreflightEvaluations', () => {
@@ -791,6 +997,11 @@ function seedAuthorizedReadyApp(opts: {
     latest_artifact_set_id: artifactId,
     source_acceptance_ref: acceptanceId,
     placement_approval_ref: opts.skipPlacement ? null : placementId,
+    // Automatic, which is what the acceptance handoff authorizes on its own.
+    // This is also what an existing installation migrates to, so a fixture
+    // standing in for a live Blueprint app has to say so before a
+    // policy-authorized mint is allowed to happen at all.
+    rollout_authorization_policy: 'automatic',
     evidence_limitations_json: JSON.stringify([
       { code: 'git_managed_rollout_not_enabled', detail: 'Blueprint rollout generations are not enabled' },
     ]),

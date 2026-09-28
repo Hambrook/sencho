@@ -156,6 +156,7 @@ function liveProjectionFixture(input: {
     drift: [],
     limitations: [],
     availableActions: [],
+    authorityPolicies: [],
   };
 }
 

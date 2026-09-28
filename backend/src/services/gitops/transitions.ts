@@ -37,6 +37,14 @@ import {
   encodeIntentHealthPolicy,
 } from './healthPolicy';
 import type { HealthPolicyDecision, HealthRolloutPolicy } from './healthPolicy';
+import {
+  configuredSnapshotFor,
+  decodePolicySnapshot,
+  encodePolicySnapshot,
+  policyValuesEqual,
+} from './policyComposition';
+import type { PlacementPolicy, RolloutAuthorizationPolicy } from './policyComposition';
+import type { PlacementPolicyReason } from './placementPolicy';
 import { runningGenerationForTarget } from './recoveryCapture';
 
 
@@ -1393,6 +1401,81 @@ export class GitOpsTransitions {
   }
 
   /**
+   * Change the placement policy. Configuration, not work.
+   *
+   * Mints no intent revision and no rollout candidate, and clears no source
+   * acceptance, placement approval, or rollout authorization. The edit decides
+   * what a *future* placement decision may do; the approvals already standing
+   * were made under the snapshot that authorized them and keep running under
+   * it. That is the same rule the health policy write follows, and it is why a
+   * policy change never appears as drift.
+   *
+   * Refuses while an operation is in flight, because the operation is reading
+   * the policy this edit would change underneath it.
+   */
+  placementPolicyChanged(args: {
+    applicationId: string;
+    placementPolicy: PlacementPolicy;
+    envelope: EventEnvelope;
+  }): TransitionResult {
+    return this.mutateApp(
+      args.applicationId,
+      args.envelope,
+      'placement_policy_changed',
+      'committed',
+      (app) => {
+        if (app.lifecycle_status !== 'active') throw new GitOpsTransitionError('application is not live');
+        if (app.active_operation_stage) {
+          throw new GitOpsTransitionError('cannot change the placement policy while an operation is in flight');
+        }
+        if (app.placement_policy === args.placementPolicy) {
+          throw new GitOpsTransitionError('the placement policy is already set to that value');
+        }
+        const before = { placementPolicy: app.placement_policy };
+        app.placement_policy = args.placementPolicy;
+        // A reason recorded under the old policy explains a decision that policy
+        // made, and this one is no longer configured. Left in place it would be
+        // read as the current reason for whatever review is open next.
+        app.placement_policy_refusal_reason = null;
+        app.placement_policy_refused_at = null;
+        return { before, after: { placementPolicy: args.placementPolicy } };
+      },
+    );
+  }
+
+  /**
+   * Change the rollout authorization policy. Configuration, not work, on the
+   * same terms as `placementPolicyChanged`: nothing already authorized is
+   * withdrawn, and no intent, candidate, or generation is minted or cleared.
+   */
+  rolloutAuthorizationPolicyChanged(args: {
+    applicationId: string;
+    policy: RolloutAuthorizationPolicy;
+    envelope: EventEnvelope;
+  }): TransitionResult {
+    return this.mutateApp(
+      args.applicationId,
+      args.envelope,
+      'rollout_authorization_policy_changed',
+      'committed',
+      (app) => {
+        if (app.lifecycle_status !== 'active') throw new GitOpsTransitionError('application is not live');
+        if (app.active_operation_stage) {
+          throw new GitOpsTransitionError(
+            'cannot change the rollout authorization policy while an operation is in flight',
+          );
+        }
+        if (app.rollout_authorization_policy === args.policy) {
+          throw new GitOpsTransitionError('the rollout authorization policy is already set to that value');
+        }
+        const before = { rolloutAuthorizationPolicy: app.rollout_authorization_policy };
+        app.rollout_authorization_policy = args.policy;
+        return { before, after: { rolloutAuthorizationPolicy: args.policy } };
+      },
+    );
+  }
+
+  /**
    * Stop acting on a source without forgetting anything about it.
    *
    * Suspension is a decision about future work, so every success pointer stays
@@ -1947,8 +2030,8 @@ export class GitOpsTransitions {
   }
 
   /**
-   * Operator placement approval opens a rollout generation for the current
-   * intent and candidate.
+   * Placement approval opens a rollout generation for the current intent and
+   * candidate.
    *
    * History order is placement_approved, then rollout_generation_opened, so a
    * reader can tell the approval happened before the generation pointer
@@ -1957,6 +2040,19 @@ export class GitOpsTransitions {
    * gets the default), `placement_approval` for the decomposed Git-managed
    * action, where the generation is a placement-only placeholder until a
    * rollout authorization supersedes it.
+   *
+   * `authority` is required rather than defaulted, because a default here would
+   * silently mislabel an automatic approval as an operator's. The only two
+   * values are an operator and a configured policy, and `policyProvenanceJson`
+   * must be supplied whenever the authority is the policy: a decision with no
+   * record of the snapshot that made it is not reviewable, so the pair is
+   * checked together rather than trusted individually.
+   *
+   * Refuses when an approval already exists for this intent and candidate. The
+   * currency checks below only catch a *stale* approval, so replaying the same
+   * current one would otherwise mint a second approval row, supersede the
+   * generation it had just opened, and write a second pair of history rows
+   * under a fresh operation id.
    */
   placementApproved(args: {
     applicationId: string;
@@ -1969,6 +2065,8 @@ export class GitOpsTransitions {
     envelope: EventEnvelope;
     rolloutGenerationId: string;
     candidateId: string;
+    authority: 'operator' | 'configured_policy';
+    policyProvenanceJson: string | null;
     strategyJson?: string;
     provenance?: 'legacy_inline' | 'placement_approval';
   }): TransitionResult {
@@ -1979,6 +2077,36 @@ export class GitOpsTransitions {
       'committed',
       (app, extras) => {
         if (app.lifecycle_status !== 'active') throw new GitOpsTransitionError('application is not live');
+        if (args.authority === 'configured_policy' && args.policyProvenanceJson === null) {
+          throw new GitOpsTransitionError('a policy-authorized approval must record its policy snapshot');
+        }
+        if (args.authority === 'operator' && args.policyProvenanceJson !== null) {
+          throw new GitOpsTransitionError('an operator approval records no policy snapshot');
+        }
+        if (args.authority === 'configured_policy' && args.policyProvenanceJson !== null) {
+          // The snapshot that authorized the decision was read by the caller,
+          // before this transaction. The generation below freezes the policy
+          // configured right now. A policy edit landing in between would make
+          // those two records disagree about one decision, and would mean the
+          // approval was granted under a policy the operator had already
+          // revoked. Comparing them here is what makes the two records agree by
+          // construction rather than by luck.
+          const authorizing = decodePolicySnapshot(args.policyProvenanceJson);
+          if (!policyValuesEqual(authorizing, configuredSnapshotFor(app))) {
+            throw new GitOpsTransitionError('the placement policy changed while the decision was being applied');
+          }
+        }
+        // The single writer checks its own domain, exactly as `rolloutAuthorized`
+        // checks the rollout authorization policy. A caller reaching this
+        // transition with a policy-authorized approval while the placement policy
+        // is `operator` has not been authorized by anything: the snapshot happens
+        // to agree because both were read at the same moment, which is agreement
+        // by accident rather than by authority. Refusing here means the domain
+        // rule cannot be satisfied by a caller that simply passes a matching
+        // snapshot.
+        if (args.authority === 'configured_policy' && app.placement_policy !== 'bounded_auto') {
+          throw new GitOpsTransitionError('the placement policy requires an operator to approve');
+        }
         if (app.intent_revision_id !== args.intentRevisionId) {
           throw new GitOpsTransitionError('intent revision is not current');
         }
@@ -1992,6 +2120,21 @@ export class GitOpsTransitions {
         if (candidate.intent_revision_id !== args.intentRevisionId) {
           throw new GitOpsTransitionError('rollout candidate does not match intent');
         }
+        // The replay guard, for the automatic path only.
+        //
+        // A policy-authorized approval already recorded against this exact intent
+        // and candidate means the decision is durable, and the currency checks
+        // above cannot see that because the pointers have not moved. An operator
+        // pressing Apply twice is not that: it is a deliberate second decision on
+        // the same intent, which the Inline Apply path relies on, since it reuses
+        // the current intent rather than minting a new one. Refusing it as a
+        // replay regressed a flow that had worked for ever.
+        if (
+          args.authority === 'configured_policy' &&
+          this.store().hasPlacementApprovalFor(args.applicationId, args.intentRevisionId, args.candidateId)
+        ) {
+          throw new GitOpsTransitionError('placement approval already recorded for this intent and candidate');
+        }
         const requiredNodeIds = canonicalizeNodeIds(args.requiredNodeIds);
         const requiredTargetsJson = encodeGitOpsRequiredTargetsJson(requiredNodeIds);
         // Decode before write so a malformed blast never reaches SQLite. The
@@ -2002,13 +2145,17 @@ export class GitOpsTransitions {
         this.store().insertApproval({
           id: args.approvalId,
           kind: 'placement_approval',
-          authority: 'operator',
+          authority: args.authority,
           authoritative: 1,
           application_id: args.applicationId,
           generation_id: null,
           intent_revision_id: args.intentRevisionId,
           artifact_set_id: null,
-          rollout_candidate_id: null,
+          // The candidate this approval was made against. Recorded so the replay
+          // guard can key on the pair, since nothing enforced that an intent
+          // revision opens only one candidate, and a second candidate under the
+          // same intent would otherwise be refused as a replay of the first.
+          rollout_candidate_id: args.candidateId,
           rollout_generation_id: null,
           source_acceptance_ref: null,
           placement_approval_ref: null,
@@ -2016,7 +2163,7 @@ export class GitOpsTransitions {
           preflight_fingerprint: null,
           fingerprint: args.fingerprint,
           blast_json: blastJson,
-          policy_provenance_json: null,
+          policy_provenance_json: args.policyProvenanceJson,
           actor: args.actor,
           created_at: args.envelope.at,
         });
@@ -2045,6 +2192,10 @@ export class GitOpsTransitions {
           required_targets_json: requiredTargetsJson,
           preflight_fingerprint: null,
           preflight_evidence_json: null,
+          // Frozen here, at the moment the generation opens. A policy edit later
+          // changes what the NEXT generation may do and leaves this one running
+          // under the snapshot that authorized it.
+          policy_snapshot_json: encodePolicySnapshot(configuredSnapshotFor(app)),
           rollout_strategy_json: args.strategyJson ?? '{}',
           provenance: args.provenance ?? 'legacy_inline',
           supersedes_generation_id: previousGenerationId,
@@ -2064,6 +2215,12 @@ export class GitOpsTransitions {
         // gitops_approvals as history of the pre-decomposition approval.
         app.legacy_combined_approval_ref = null;
         app.rollout_generation_id = args.rolloutGenerationId;
+        // The review this refusal left behind is resolved by this approval, and
+        // on the policy path the approval is recorded in the same pass that
+        // recorded the refusal, so leaving it would name the decision that
+        // produced the approval still sitting on the row.
+        app.placement_policy_refusal_reason = null;
+        app.placement_policy_refused_at = null;
 
         const approved = this.history(app, args.envelope, {
           stage: 'placement_approved',
@@ -2111,6 +2268,27 @@ export class GitOpsTransitions {
         if (app.lifecycle_status !== 'active') throw new GitOpsTransitionError('application is not live');
         if (app.target_mode !== 'blueprint') {
           throw new GitOpsTransitionError('rollout authorization is only for Blueprint target mode');
+        }
+        // The mint-time gates, enforced here rather than at the caller.
+        //
+        // These belong to the act of creating authority, so tying them to the
+        // single writer is what makes them unbypassable. A caller-side check
+        // cannot: this transition is reached from the acceptance handoff, the
+        // Blueprint dispatch, the startup reconstruction, the preflight backfill,
+        // and the operator route, and it is also reached to *remint* when the
+        // preflight fingerprint drifts. Gating on whether a binding happened to
+        // exist skipped the drift remint, so a tag move could discard an
+        // operator's authorization and replace it with a fresh policy-authorized
+        // one, with no operator and no policy that permitted it.
+        if ((args.authority ?? 'configured_policy') === 'configured_policy') {
+          if (app.rollout_authorization_policy !== 'automatic') {
+            throw new GitOpsTransitionError(
+              'the rollout authorization policy requires an operator to authorize',
+            );
+          }
+        }
+        if (app.active_operation_stage) {
+          throw new GitOpsTransitionError('an operation is already in flight for this application');
         }
         if (app.rollout_authorization_ref) {
           const live = this.store().currentAuthorizationBinding(app);
@@ -2188,6 +2366,10 @@ export class GitOpsTransitions {
           preflight_fingerprint: args.preflightFingerprint,
           preflight_evidence_json: args.preflightEvidenceJson,
           rollout_strategy_json: args.strategyJson ?? '{}',
+          // The snapshot this generation executes. Read from the live
+          // application row rather than from the binding, so what is frozen is
+          // what the operator has configured, not a value a caller supplied.
+          policy_snapshot_json: encodePolicySnapshot(configuredSnapshotFor(app)),
           provenance: 'rollout_authorization',
           supersedes_generation_id: previousGenerationId,
           superseded_at: null,
@@ -3660,6 +3842,43 @@ export class GitOpsTransitions {
   }
 
   /**
+   * Record why bounded automatic placement declined, so the question it left
+   * behind can be answered.
+   *
+   * The decision itself is computed and returned to the producer, which discards
+   * it. Without this row a placement waiting for review under an automatic policy
+   * is indistinguishable from a policy that never fires, and that is exactly how
+   * an automatic path reads when it is broken: the surface shows a review, the
+   * policy says automatic, and nothing explains the gap.
+   *
+   * Cleared rather than left to go stale, in two places and for the same reason.
+   * An approval resolves the review, and a policy change makes the old reason
+   * describe a policy that is no longer configured. A stale reason would be read
+   * as the current one, which is the failure this row exists to remove. Both
+   * clears write the two columns inside the transition that causes them, rather
+   * than calling here afterwards, so the reason and the change that invalidated
+   * it commit together.
+   *
+   * Writes no history: a refusal is a routine evaluation that re-runs on the
+   * next producer pass, and history is the operator's audit trail of decisions
+   * that stood. The reason on the application row is the read model for the
+   * review currently open, not a record of every evaluation that ever ran.
+   */
+  placementPolicyRefused(args: {
+    applicationId: string;
+    reason: PlacementPolicyReason;
+    at?: number;
+  }): void {
+    this.raw().transaction(() => {
+      const app = this.store().getApplication(args.applicationId);
+      if (!app) throw new GitOpsTransitionError('application not found');
+      app.placement_policy_refusal_reason = args.reason;
+      app.placement_policy_refused_at = args.at ?? Date.now();
+      this.writeApplication(app);
+    })();
+  }
+
+  /**
    * Record or clear the deploy-time registry preflight limitation on the
    * application row. Acceptance and artifact pointers stay intact when set.
    */
@@ -4041,7 +4260,9 @@ export class GitOpsTransitions {
         latest_operation_id=?, active_operation_id=?,
         active_operation_stage=?, active_operation_at=?, active_generation_id=?,
         pause_at=?, pause_reason=?, source_suspended_reason=?,
-        source_policy=?, poll_interval_secs=?, next_poll_at=?, attempt_seq=?, partial_json=?,
+        source_policy=?, placement_policy=?, rollout_authorization_policy=?,
+        placement_policy_refusal_reason=?, placement_policy_refused_at=?,
+        poll_interval_secs=?, next_poll_at=?, attempt_seq=?, partial_json=?,
         failure_stage=?, failure_class=?, failure_at=?, retry_at=?, retry_count=?,
         suspended_at=?, recovery_ref=?, recovery_phase=?,
         interruption_stage=?, interruption_at=?, interruption_operation_id=?,
@@ -4059,7 +4280,9 @@ export class GitOpsTransitions {
       app.latest_operation_id, app.active_operation_id,
       app.active_operation_stage, app.active_operation_at, app.active_generation_id,
       app.pause_at, app.pause_reason, app.source_suspended_reason,
-      app.source_policy, app.poll_interval_secs, app.next_poll_at, app.attempt_seq, app.partial_json,
+      app.source_policy, app.placement_policy, app.rollout_authorization_policy,
+      app.placement_policy_refusal_reason, app.placement_policy_refused_at,
+      app.poll_interval_secs, app.next_poll_at, app.attempt_seq, app.partial_json,
       app.failure_stage, app.failure_class, app.failure_at, app.retry_at, app.retry_count,
       app.suspended_at, app.recovery_ref, app.recovery_phase,
       app.interruption_stage, app.interruption_at, app.interruption_operation_id,
@@ -4081,5 +4304,16 @@ function snapshotApp(app: GitOpsApplicationRow): Record<string, unknown> {
     sourceAcceptanceRef: app.source_acceptance_ref,
     activeOperationStage: app.active_operation_stage,
     failureStage: app.failure_stage,
+    // The three authority policies, and the recorded bounded-auto refusal.
+    //
+    // Without these a policy change wrote a history row with no before and no
+    // after for the one thing it changed, so the audit trail said a policy
+    // changed without recording which way. The refusal belongs with them because
+    // it is cleared by two of the same transitions, and a reader asking why a
+    // reason went away needs the policy that produced it on the same row.
+    sourcePolicy: app.source_policy,
+    placementPolicy: app.placement_policy,
+    rolloutAuthorizationPolicy: app.rollout_authorization_policy,
+    placementPolicyRefusalReason: app.placement_policy_refusal_reason,
   };
 }

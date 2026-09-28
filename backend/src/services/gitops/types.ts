@@ -2,6 +2,11 @@ import type { ArtifactEvidenceJson, ObservedArtifactIdentity, ServiceArtifactEvi
 import type { RepoIdentity } from './repoIdentity';
 import type { RefKind } from '../git/types';
 import type { HealthRolloutPolicy } from './healthPolicy';
+import type { PlacementPolicy, RolloutAuthorizationPolicy } from './policyComposition';
+import type { PlacementPolicyReason } from './placementPolicy';
+
+export type { PlacementPolicyReason };
+import type { AuthorityPolicyRead } from './authorityPolicyProjection';
 
 export type GitOpsTargetMode = 'direct' | 'inline_blueprint' | 'blueprint';
 export type GitOpsLifecycleStatus = 'active' | 'creating' | 'detached' | 'deleted';
@@ -114,6 +119,26 @@ export type GitOpsApplicationRow = {
   source_suspended_reason: string | null;
   /** Controller-owned. See gitops/SourceController.ts. */
   source_policy: SourcePolicy;
+  /**
+   * Whether a change in Blueprint target intent needs an operator. Configured
+   * independently of `source_policy`: accepting content says nothing about
+   * where it may run.
+   */
+  placement_policy: PlacementPolicy;
+  /**
+   * Whether rollout authorization is minted by policy or waits for an operator.
+   * Configured independently of both other domains, and never satisfied by
+   * either of them.
+   */
+  rollout_authorization_policy: RolloutAuthorizationPolicy;
+  /**
+   * Why bounded automatic placement last declined, and when it did. Null when
+   * nothing has declined: never evaluated, or the policy is `operator`, or the
+   * last evaluation approved. Absence is not "reviewed and found nothing", so a
+   * reader must not report a clean review from a null here.
+   */
+  placement_policy_refusal_reason: PlacementPolicyReason | null;
+  placement_policy_refused_at: number | null;
   poll_interval_secs: number | null;
   next_poll_at: number | null;
   attempt_seq: number;
@@ -278,6 +303,15 @@ export type GitOpsRolloutGenerationRow = {
   preflight_fingerprint: string | null;
   preflight_evidence_json: string | null;
   rollout_strategy_json: string;
+  /**
+   * The policy snapshot this generation executes, frozen when it opened.
+   *
+   * NULL on a generation that predates the column, which is the one case that
+   * reconstructs rather than carrying a recorded value. Never defaulted to an
+   * empty object: that would make absence impossible and turn every existing
+   * generation into a decode failure.
+   */
+  policy_snapshot_json: string | null;
   provenance: GitOpsRolloutGenerationProvenance;
   supersedes_generation_id: string | null;
   superseded_at: number | null;
@@ -949,6 +983,13 @@ export type GitOpsRevisionProjection =
       limitations: readonly GitOpsLimitation[];
       availableActions: [];
       approvals: null;
+      /**
+       * Empty, because an application that does not exist has no configured
+       * policy to report. The field is present rather than absent so a reader
+       * never has to tell "no application" from "an older build said nothing",
+       * and those are different facts about the same endpoint.
+       */
+      authorityPolicies: readonly AuthorityPolicyRead[];
     }
   | {
       schemaVersion: 1;
@@ -964,6 +1005,12 @@ export type GitOpsRevisionProjection =
       drift: GitOpsDriftItem[];
       limitations: GitOpsLimitation[];
       availableActions: GitOpsAvailableAction[];
+      /**
+       * The three authority policies, configured and effective, in stage order.
+       * See `authorityPolicyProjection` for what each field claims and, more
+       * importantly, what it refuses to claim.
+       */
+      authorityPolicies: AuthorityPolicyRead[];
     };
 
 export type { ArtifactEvidenceJson, ObservedArtifactIdentity, RepoIdentity };

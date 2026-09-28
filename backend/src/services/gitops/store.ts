@@ -74,6 +74,84 @@ export const APPLICATIONS_DUE_FOR_RETRY_SQL = `SELECT * FROM gitops_applications
        ORDER BY retry_at ASC
        LIMIT ?`;
 
+/**
+ * The application insert's column list, in the order the values are passed.
+ *
+ * Held as one list so the placeholder count is derived from it. A hardcoded
+ * count is a trap: adding a column here and not to the count compiles cleanly
+ * and fails at runtime as a SQLite arity error on the first insert, which is
+ * the first write any create path makes.
+ */
+const APPLICATION_INSERT_COLUMNS = [
+  'id',
+  'lifecycle_key',
+  'lifecycle_status',
+  'target_mode',
+  'stack_name',
+  'configured_source_stack_name',
+  'blueprint_id',
+  'configured_repo_url',
+  'repo_identity_json',
+  'configured_ref',
+  'compose_paths_json',
+  'context_dir',
+  'sync_env',
+  'env_path',
+  'materialization_fingerprint',
+  'desired_commit_sha',
+  'fetched_commit_sha',
+  'fetched_resolved_ref_kind',
+  'candidate_generation_id',
+  'accepted_generation_id',
+  'candidate_plan_blocked',
+  'review_required',
+  'review_block_reason',
+  'artifact_set_id',
+  'latest_artifact_set_id',
+  'intent_revision_id',
+  'rollout_candidate_id',
+  'rollout_generation_id',
+  'source_acceptance_ref',
+  'placement_approval_ref',
+  'rollout_authorization_ref',
+  'legacy_combined_approval_ref',
+  'preflight_fingerprint',
+  'latest_preflight_evidence_json',
+  'latest_operation_id',
+  'active_operation_id',
+  'active_operation_stage',
+  'active_operation_at',
+  'active_generation_id',
+  'pause_at',
+  'pause_reason',
+  'source_suspended_reason',
+  'source_policy',
+  'placement_policy',
+  'rollout_authorization_policy',
+  'placement_policy_refusal_reason',
+  'placement_policy_refused_at',
+  'poll_interval_secs',
+  'next_poll_at',
+  'attempt_seq',
+  'partial_json',
+  'failure_stage',
+  'failure_class',
+  'failure_at',
+  'retry_at',
+  'retry_count',
+  'suspended_at',
+  'recovery_ref',
+  'recovery_phase',
+  'interruption_stage',
+  'interruption_at',
+  'interruption_operation_id',
+  'interruption_generation_id',
+  'evidence_fresh_at',
+  'evidence_limitations_json',
+  'created_at',
+  'updated_at',
+] as const;
+
 export class GitOpsStore {
   private static instance: GitOpsStore | undefined;
 
@@ -388,6 +466,88 @@ export class GitOpsStore {
 
   getApproval(id: string): GitOpsApprovalRow | undefined {
     return this.db().prepare('SELECT * FROM gitops_approvals WHERE id = ?').get(id) as GitOpsApprovalRow | undefined;
+  }
+
+  /**
+   * The most recent placement approval ever recorded for this application.
+   *
+   * Read from history rather than through `gitops_applications.placement_approval_ref`,
+   * because an intent revision clears that pointer before a new candidate opens.
+   * Resolving the baseline through the pointer therefore found nothing on the
+   * normal path, and every multi-node candidate was refused as a first placement.
+   *
+   * The row stays valid as a baseline after a material change: the intent moved,
+   * the set an operator last approved did not.
+   */
+  latestPlacementApproval(applicationId: string): GitOpsApprovalRow | undefined {
+    return this.db()
+      .prepare(
+        `SELECT * FROM gitops_approvals
+         WHERE application_id = ? AND kind = 'placement_approval'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`,
+      )
+      .get(applicationId) as GitOpsApprovalRow | undefined;
+  }
+
+  /**
+   * Whether any approval at all ever stood behind this application's placement.
+   *
+   * Separate from `latestPlacementApproval` because the two answer different
+   * questions. That one asks what the current placement was authorized to be,
+   * and the decomposed row is the only thing that can answer it. This asks
+   * whether the application was ever placed under an operator's authority, and a
+   * pre-decomposition `legacy_combined` row answers that even though it names no
+   * target set.
+   *
+   * A migration that carried an approval forward records exactly that row, so an
+   * application with one is not a first placement and must not be read as one.
+   */
+  hasEverHadPlacementAuthority(applicationId: string): boolean {
+    const row = this.db()
+      .prepare(
+        `SELECT 1 AS found FROM gitops_approvals
+         WHERE application_id = ? AND kind IN ('placement_approval', 'legacy_combined')
+         LIMIT 1`,
+      )
+      .get(applicationId) as { found: number } | undefined;
+    return row !== undefined;
+  }
+
+  /**
+   * Whether a placement approval already exists against this intent revision.
+   *
+   * The replay guard. An application pointer only says an approval is stale, so
+   * replaying the *same* current approval passes every currency check and would
+   * otherwise mint a second approval row and supersede the generation the first
+   * one had just opened.
+   *
+   * Keyed on the intent and the candidate together. Keying on the intent alone
+   * assumed an intent revision opens exactly one candidate, which nothing
+   * enforces, so a legitimate approval against a second candidate under the same
+   * intent would have been refused as a replay.
+   *
+   * A pre-existing approval row recorded before the candidate was stored here
+   * has a null candidate and is deliberately not matched: refusing on it would
+   * block a first approval against a candidate that never had one, which is the
+   * opposite of what this guard is for.
+   */
+  hasPlacementApprovalFor(
+    applicationId: string,
+    intentRevisionId: string,
+    rolloutCandidateId: string,
+  ): boolean {
+    const row = this.db()
+      .prepare(
+        `SELECT 1 AS found FROM gitops_approvals
+         WHERE application_id = ?
+           AND kind = 'placement_approval'
+           AND intent_revision_id = ?
+           AND rollout_candidate_id = ?
+         LIMIT 1`,
+      )
+      .get(applicationId, intentRevisionId, rolloutCandidateId);
+    return row !== undefined;
   }
 
   getTarget(applicationId: string, nodeId: number): GitOpsTargetCurrentRow | undefined {
@@ -727,22 +887,8 @@ export class GitOpsStore {
 
   insertApplication(row: GitOpsApplicationRow): void {
     this.db().prepare(
-      `INSERT INTO gitops_applications (
-        id, lifecycle_key, lifecycle_status, target_mode, stack_name, configured_source_stack_name, blueprint_id,
-        configured_repo_url, repo_identity_json, configured_ref, compose_paths_json,
-        context_dir, sync_env, env_path, materialization_fingerprint, desired_commit_sha,
-        fetched_commit_sha, fetched_resolved_ref_kind, candidate_generation_id, accepted_generation_id,
-        candidate_plan_blocked, review_required, review_block_reason, artifact_set_id, latest_artifact_set_id,
-        intent_revision_id, rollout_candidate_id, rollout_generation_id, source_acceptance_ref,
-        placement_approval_ref, rollout_authorization_ref, legacy_combined_approval_ref,
-        preflight_fingerprint, latest_preflight_evidence_json, latest_operation_id, active_operation_id, active_operation_stage,
-        active_operation_at, active_generation_id, pause_at, pause_reason, source_suspended_reason,
-        source_policy, poll_interval_secs, next_poll_at, attempt_seq, partial_json,
-        failure_stage, failure_class, failure_at, retry_at, retry_count, suspended_at,
-        recovery_ref, recovery_phase, interruption_stage, interruption_at,
-        interruption_operation_id, interruption_generation_id, evidence_fresh_at,
-        evidence_limitations_json, created_at, updated_at
-      ) VALUES (${Array(63).fill('?').join(', ')})`,
+      `INSERT INTO gitops_applications (${APPLICATION_INSERT_COLUMNS.join(', ')})
+       VALUES (${APPLICATION_INSERT_COLUMNS.map(() => '?').join(', ')})`,
     ).run(
       row.id, row.lifecycle_key, row.lifecycle_status, row.target_mode, row.stack_name,
       row.configured_source_stack_name, row.blueprint_id,
@@ -754,7 +900,9 @@ export class GitOpsStore {
       row.placement_approval_ref, row.rollout_authorization_ref, row.legacy_combined_approval_ref,
       row.preflight_fingerprint, row.latest_preflight_evidence_json, row.latest_operation_id, row.active_operation_id, row.active_operation_stage,
       row.active_operation_at, row.active_generation_id, row.pause_at, row.pause_reason, row.source_suspended_reason,
-      row.source_policy, row.poll_interval_secs, row.next_poll_at, row.attempt_seq, row.partial_json,
+      row.source_policy, row.placement_policy, row.rollout_authorization_policy,
+      row.placement_policy_refusal_reason, row.placement_policy_refused_at,
+      row.poll_interval_secs, row.next_poll_at, row.attempt_seq, row.partial_json,
       row.failure_stage, row.failure_class, row.failure_at, row.retry_at, row.retry_count, row.suspended_at,
       row.recovery_ref, row.recovery_phase, row.interruption_stage, row.interruption_at,
       row.interruption_operation_id, row.interruption_generation_id, row.evidence_fresh_at,
@@ -857,13 +1005,15 @@ export class GitOpsStore {
         id, application_id, intent_revision_id, rollout_candidate_id, accepted_generation_id,
         artifact_set_id, placement_approval_ref, source_acceptance_ref, rollout_authorization_ref,
         required_targets_json, preflight_fingerprint, preflight_evidence_json, rollout_strategy_json,
+        policy_snapshot_json,
         provenance, supersedes_generation_id, superseded_at, operation_id, actor, trigger, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       row.id, row.application_id, row.intent_revision_id, row.rollout_candidate_id,
       row.accepted_generation_id, row.artifact_set_id, row.placement_approval_ref,
       row.source_acceptance_ref, row.rollout_authorization_ref, row.required_targets_json,
       row.preflight_fingerprint, row.preflight_evidence_json, row.rollout_strategy_json,
+      row.policy_snapshot_json,
       row.provenance, row.supersedes_generation_id, row.superseded_at, row.operation_id,
       row.actor, row.trigger, row.created_at,
     );

@@ -206,6 +206,10 @@ function seedGitManagedBlueprint(opts: { nodeCount?: number } = {}): Seeded {
     review_required: 0,
     review_block_reason: null,
     source_policy: 'manual',
+    // The automatic dispatch path this fixture exercises is what an existing
+    // installation has, so the policy has to say so. The fresh-install default
+    // is manual, and a policy-authorized mint is refused without this.
+    rollout_authorization_policy: 'automatic',
   };
   store.insertApplication(row);
   store.insertIntentRevision(intentRow(intentId, applicationId, blueprint.id, stackName));
@@ -257,6 +261,8 @@ async function authorizeRollout(seeded: Seeded): Promise<void> {
     envelope,
     rolloutGenerationId: `rgen-${randomUUID().slice(0, 8)}`,
     candidateId: seeded.candidateId,
+    authority: 'operator',
+    policyProvenanceJson: null,
     provenance: 'placement_approval',
   });
   const result = await ensureRolloutAuthorization(seeded.applicationId, 'tester', 'test', undefined, 'operator');
@@ -539,6 +545,8 @@ describe('POST /api/gitops/applications/:id/rollout/supersede', () => {
       envelope: { operationId: randomUUID(), actor: 'tester', trigger: 'test', at: Date.now() },
       rolloutGenerationId: `rgen-${randomUUID().slice(0, 8)}`,
       candidateId: seeded.candidateId,
+      authority: 'operator',
+      policyProvenanceJson: null,
       provenance: 'placement_approval',
     });
     const res = await request(app)
