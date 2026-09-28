@@ -17,7 +17,9 @@ interface BlueprintCatalogProps {
 
 type ModeFilter = 'all' | 'observe' | 'suggest' | 'enforce' | 'drifted';
 
-const STATUS_PRIORITY: BlueprintDeploymentStatus[] = ['failed', 'name_conflict', 'evict_blocked', 'pending_state_review', 'drifted', 'correcting', 'deploying', 'pending', 'active', 'withdrawing', 'withdrawn'];
+// A held repair outranks a plain drifted row: both need attention, but a hold
+// is one Sencho declined to fix, so it is the one an operator has to act on.
+const STATUS_PRIORITY: BlueprintDeploymentStatus[] = ['failed', 'name_conflict', 'evict_blocked', 'pending_state_review', 'repair_held', 'drifted', 'correcting', 'deploying', 'pending', 'active', 'withdrawing', 'withdrawn'];
 
 function dominantStatus(counts: Partial<Record<BlueprintDeploymentStatus, number>>): BlueprintDeploymentStatus | null {
     for (const status of STATUS_PRIORITY) {
@@ -35,6 +37,7 @@ function statusDot(status: BlueprintDeploymentStatus | null): string {
         case 'failed':
         case 'name_conflict': return 'bg-destructive';
         case 'drifted':
+        case 'repair_held':
         case 'pending':
         case 'pending_state_review':
         case 'evict_blocked':
@@ -50,7 +53,10 @@ export function BlueprintCatalog({ blueprints, onSelect, onCreate, canCreate }: 
         const c = { all: blueprints.length, observe: 0, suggest: 0, enforce: 0, drifted: 0 };
         for (const b of blueprints) {
             c[b.drift_mode] = (c[b.drift_mode] ?? 0) + 1;
-            if ((b.deploymentCounts.drifted ?? 0) > 0) c.drifted += 1;
+            // A held row counts as drift on this chip, because the chip is how an
+            // operator finds it. The tile's own state comes from the status
+            // priority list, which already ranks a hold.
+            if ((b.deploymentCounts.drifted ?? 0) > 0 || (b.deploymentCounts.repair_held ?? 0) > 0) c.drifted += 1;
         }
         return c;
     }, [blueprints]);
@@ -58,7 +64,10 @@ export function BlueprintCatalog({ blueprints, onSelect, onCreate, canCreate }: 
     const filtered = useMemo(() => {
         switch (filter) {
             case 'all': return blueprints;
-            case 'drifted': return blueprints.filter(b => (b.deploymentCounts.drifted ?? 0) > 0);
+            // A held row is drift too, so the Drifted chip has to count it or a
+            // Blueprint that is only held disappears from the filter that exists
+            // to find exactly that.
+            case 'drifted': return blueprints.filter(b => (b.deploymentCounts.drifted ?? 0) > 0 || (b.deploymentCounts.repair_held ?? 0) > 0);
             default: return blueprints.filter(b => b.drift_mode === filter);
         }
     }, [blueprints, filter]);

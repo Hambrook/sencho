@@ -77,17 +77,24 @@ const REMOTE_HTTP_TIMEOUT_MS = 30_000;
 
 export type DriftCause = 'revision' | 'container' | 'digest';
 
+/**
+ * Why this target's drift cannot be repaired, discovered while detecting it.
+ *
+ * Detection and repair are separate decisions. A target whose repair authority
+ * is unprovable can still be *seen* to be drifted, and hiding that behind the
+ * hold is how a stopped container or a replaced image went unreported across a
+ * whole fleet. So detection always completes and carries the block with it, and
+ * the reconciler decides what the block means for the mode it is in.
+ */
+export type RepairBlock = {
+    reason: RuntimeRepairHoldReason;
+    detail: string;
+};
+
 export type DriftCheckResult =
     | { kind: 'matched' }
-    | { kind: 'drifted'; reason: string; cause: DriftCause }
-    | { kind: 'unverified'; reason: string }
-    /**
-     * The target cannot be repaired and must not be: the authority a repair
-     * would restore is missing, unreadable, or has moved on. Distinct from
-     * `unverified` because this is a decision, not a failure to observe, and
-     * because it must stay visible as a hold rather than pass as "no drift".
-     */
-    | { kind: 'held'; reason: RuntimeRepairHoldReason; detail: string };
+    | { kind: 'drifted'; reason: string; cause: DriftCause; repairBlock?: RepairBlock }
+    | { kind: 'unverified'; reason: string; repairBlock?: RepairBlock };
 
 function isDeveloperModeEnabled(): boolean {
     try {
@@ -790,16 +797,51 @@ export class BlueprintService {
 
     /**
      * Inspect deployment state on a node and classify drift for the reconciler.
-     *
      * `matched` means marker + running containers + a comparable exact/qualified
      * expected set whose identity matches the observation. `drifted` means a
-     * restorable divergence (marker/revision/not-running/digest mismatch).
-     * `unverified` means the check could not prove either side (no application
-     * row, unreachable node, missing expected set, or non-comparable observation)
-     * and must never trigger Enforce. `held` means the target has no restorable
-     * identity, so Enforce must decline rather than guess.
+     * divergence (marker/revision/not-running/digest mismatch), optionally
+     * carrying a `repairBlock` saying Enforce may not act on it. `unverified`
+     * means the check could not prove either side (no application row,
+     * unreachable node, missing expected set, or non-comparable observation).
+     * It carries a block only when a repair is barred outright; a marker that
+     * merely fails to prove the repair authority is not one, because nothing
+     * would have attempted a repair anyway.
+     *
+     * Drift is detected even when the repair is blocked. A legacy marker or a
+     * superseded rollout says Sencho may not overwrite what is running; it does
+     * not say the workload is fine.
      */
     async checkForDrift(blueprint: Blueprint, node: Node): Promise<DriftCheckResult> {
+        // Two blocks, named apart, because they reach different surfaces.
+        //
+        // A binding hold is a standing decision that Sencho must not write to this
+        // target, whatever the check can or cannot classify. A marker that names
+        // no generation, or a different one, says only that a repair could not
+        // prove what it would overwrite, and nothing about whether the workload
+        // is drifted.
+        //
+        // A drifted result carries whichever applies, because a repair is about to
+        // be attempted and the mutation sites trust this result: `deployToNode` and
+        // `reapplyAuthorizedMaterialization` will write to the node on its strength.
+        // An unverified result attempts no repair, and the reconciler's only use of
+        // its block is recording a hold and an alert, so it carries the binding
+        // hold alone. Carrying the marker case there would report every target
+        // whose marker predates the generation fields as held on any tick the check
+        // could not classify, and announce a declined auto-fix that was never due.
+        //
+        // Declared out here rather than inside the try so the catch can reach them:
+        // a transport failure is exactly the case where a hold must survive.
+        let bindingBlock: RepairBlock | undefined;
+        let markerBlock: RepairBlock | undefined;
+        const drifted = (reason: string, cause: DriftCause): DriftCheckResult => {
+            const block = bindingBlock ?? markerBlock;
+            return { kind: 'drifted', reason, cause, ...(block ? { repairBlock: block } : {}) };
+        };
+        const unverified = (reason: string): DriftCheckResult => ({
+            kind: 'unverified',
+            reason,
+            ...(bindingBlock ? { repairBlock: bindingBlock } : {}),
+        });
         try {
             const store = GitOpsStore.getInstance();
             const app = store.getLiveBlueprintApplication(blueprint.id);
@@ -813,69 +855,69 @@ export class BlueprintService {
             // a decision to decline a repair.
             if (!target) return { kind: 'unverified', reason: 'no GitOps target for this node' };
 
+            // Resolved first so the rest of the check can carry the block, not
+            // stop on it.
             const binding = resolveRuntimeRepairBinding(store, app, target);
             if (binding.kind === 'hold') {
-                // A hold refuses to mutate, not to observe. What is actually
-                // running on the node is precisely the evidence an operator needs
-                // when a hold blocks the repair, and it is what the drift surfaces
-                // read, so it is captured before returning. Without this the one
-                // target that most needs explaining reports nothing at all.
-                await this.captureHeldObservation(blueprint, node, app.id);
-                return {
-                    kind: 'held',
-                    reason: binding.reason,
-                    detail: describeRuntimeRepairHold(binding.reason),
-                };
+                bindingBlock = { reason: binding.reason, detail: describeRuntimeRepairHold(binding.reason) };
             }
 
             const marker = await this.readMarker(blueprint.name, node);
             if (!marker) {
-                return { kind: 'drifted', reason: 'marker file missing on node', cause: 'revision' };
+                return drifted('marker file missing on node', 'revision');
             }
             if (marker.blueprintId !== blueprint.id) {
-                return { kind: 'drifted', reason: 'marker references a different blueprint', cause: 'revision' };
+                return drifted('marker references a different blueprint', 'revision');
             }
-            // A node whose marker names a different generation than the target
-            // acknowledged is not a restorable divergence: Sencho cannot tell
-            // whether the node is behind a rollout or was overwritten by
-            // something else, so the rollout decides, not the drift policy.
-            if (app.target_mode === 'blueprint') {
+            // A marker that names no generation, or a different one than the
+            // target acknowledged, means a repair could not prove what it would
+            // overwrite. It says nothing about whether the workload is drifted,
+            // so it blocks the repair and the container and digest checks below
+            // still run. Returning here instead is what let an upgrade hide a
+            // stopped container on every Git-managed target in the fleet.
+            if (app.target_mode === 'blueprint' && !bindingBlock && binding.kind === 'binding') {
                 if (!marker.generationId) {
-                    return {
-                        kind: 'held',
+                    markerBlock = {
                         reason: 'evidence_incomplete',
                         detail: 'the marker on this node names no generation, so a repair could not prove what it would overwrite',
                     };
-                }
-                if (marker.generationId !== binding.acceptedGenerationId) {
-                    return {
-                        kind: 'held',
+                } else if (marker.generationId !== binding.acceptedGenerationId) {
+                    markerBlock = {
                         reason: 'binding_incoherent',
                         detail: `the node runs generation ${marker.generationId} but this target acknowledged ${binding.acceptedGenerationId}`,
                     };
                 }
             }
             if (marker.revision !== blueprint.revision) {
-                return {
-                    kind: 'drifted',
-                    reason: `revision drift (node has ${marker.revision}, blueprint is ${blueprint.revision})`,
-                    cause: 'revision',
-                };
+                return drifted(
+                    `revision drift (node has ${marker.revision}, blueprint is ${blueprint.revision})`,
+                    'revision',
+                );
             }
 
             const containerState = await this.containerHealth(blueprint.name, node);
             if (containerState.kind === 'unreachable') {
-                return { kind: 'unverified', reason: containerState.detail };
+                return unverified(containerState.detail);
             }
             if (containerState.kind === 'not_running') {
-                return { kind: 'drifted', reason: containerState.detail, cause: 'container' };
+                return drifted(containerState.detail, 'container');
             }
 
             const observed = await this.observeRuntimeIdentity(blueprint.name, node);
             if (!observed) {
-                return { kind: 'unverified', reason: 'runtime identity could not be collected' };
+                return unverified('runtime identity could not be collected');
             }
+            // Recorded on every path that reaches here, including a blocked one.
+            // A hold says Sencho may not overwrite the workload; it is not a
+            // reason to stop recording what the workload is.
             this.recordRuntimeObservation(blueprint.name, node, app.id, observed);
+
+            // With no resolved binding there is no authority to compare against,
+            // so the artifact question cannot be answered either way. The block
+            // travels with the answer so the hold is still visible.
+            if (binding.kind === 'hold') {
+                return unverified('no authoritative artifact set to compare the observation against');
+            }
 
             // The expected set is the one this target acknowledged. Reading the
             // application's current set here would let a newer accepted
@@ -888,7 +930,7 @@ export class BlueprintService {
                 !expectedRow
                 || (expectedRow.qualification !== 'exact' && expectedRow.qualification !== 'qualified')
             ) {
-                return { kind: 'unverified', reason: 'expected artifact set is not comparable' };
+                return unverified('expected artifact set is not comparable');
             }
             let expectedIdentity: string | null = null;
             let expectedServices: ServiceArtifactEvidence[] | undefined;
@@ -897,40 +939,32 @@ export class BlueprintService {
                 expectedIdentity = 'identity' in decoded ? decoded.identity : null;
                 expectedServices = 'services' in decoded ? decoded.services : undefined;
             } catch {
-                return { kind: 'unverified', reason: 'expected artifact evidence is invalid' };
+                return unverified('expected artifact evidence is invalid');
             }
             if (!expectedIdentity) {
-                return { kind: 'unverified', reason: 'expected artifact identity missing' };
+                return unverified('expected artifact identity missing');
             }
 
             if (observed.kind !== 'exact' && observed.kind !== 'qualified') {
-                return { kind: 'unverified', reason: `observation is ${observed.kind}` };
+                return unverified(`observation is ${observed.kind}`);
             }
             if (expectedServices && expectedServices.length > 0) {
                 if (!observed.services || observed.services.length === 0) {
-                    return { kind: 'unverified', reason: 'observation has no per-service digest evidence' };
+                    return unverified('observation has no per-service digest evidence');
                 }
                 if (comparableObservationMatches(expectedServices, observed)) {
                     return { kind: 'matched' };
                 }
-                return {
-                    kind: 'drifted',
-                    reason: 'runtime artifact identity differs from the expected artifact set',
-                    cause: 'digest',
-                };
+                return drifted('runtime artifact identity differs from the expected artifact set', 'digest');
             }
             if (observed.identity !== expectedIdentity) {
-                return {
-                    kind: 'drifted',
-                    reason: 'runtime artifact identity differs from the expected artifact set',
-                    cause: 'digest',
-                };
+                return drifted('runtime artifact identity differs from the expected artifact set', 'digest');
             }
             return { kind: 'matched' };
         } catch (err) {
             // Prefer unverified over drifted so a transport failure cannot
             // trigger Enforce against an unreachable or half-observed node.
-            return { kind: 'unverified', reason: BlueprintService.formatError(err) };
+            return unverified(BlueprintService.formatError(err));
         }
     }
 
@@ -957,29 +991,6 @@ export class BlueprintService {
             console.error(
                 '[BlueprintService] Failed to record runtime observation for blueprint %s node %d:',
                 sanitizeForLog(blueprintName),
-                node.id,
-                error instanceof Error ? error.message : String(error),
-            );
-        }
-    }
-
-    /**
-     * Best-effort observation for a target whose repair is held. It must not
-     * turn the hold into a failure or a different verdict, so every error here
-     * is swallowed after the probe is attempted.
-     */
-    private async captureHeldObservation(
-        blueprint: Blueprint,
-        node: Node,
-        applicationId: string,
-    ): Promise<void> {
-        try {
-            const observed = await this.observeRuntimeIdentity(blueprint.name, node);
-            if (observed) this.recordRuntimeObservation(blueprint.name, node, applicationId, observed);
-        } catch (error) {
-            console.error(
-                '[BlueprintService] Could not observe a held target for blueprint %s node %d:',
-                sanitizeForLog(blueprint.name),
                 node.id,
                 error instanceof Error ? error.message : String(error),
             );

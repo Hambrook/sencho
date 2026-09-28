@@ -14,6 +14,7 @@ import { directApplicationFixture } from './helpers/gitopsFixtures';
 import { newGitOpsId } from '../services/gitops/directApplication';
 import { emptyTargetRow, GitOpsStore } from '../services/gitops/store';
 import { blankInlineApplication } from '../services/gitops/blueprintProducers';
+import { resolveRuntimeRepairBinding } from '../services/gitops/runtimeRepairBinding';
 import { projectApplication } from '../services/gitops/derive';
 import {
   encodeArtifactEvidenceJson,
@@ -284,6 +285,14 @@ async function seedDeployedGitManaged(args: {
   app.latest_artifact_set_id = artifactSetId;
   app.rollout_generation_id = rolloutGenerationId;
   store.writeApplicationPointers(app);
+  // The live rollout pointer is written by the authorization transition, not by
+  // the pointer writer above, so a fixture that only calls the writer leaves the
+  // application looking like it was never authorized. Placement invalidation
+  // short-circuits on this column, so without it a test cannot see a supersede
+  // that production really does perform.
+  DatabaseService.getInstance().getDb()
+    .prepare('UPDATE gitops_applications SET rollout_generation_id = ? WHERE id = ?')
+    .run(rolloutGenerationId, appId);
   store.upsertTarget({
     ...emptyTargetRow(appId, node.id, Date.now()),
     target_status: 'active',
@@ -333,6 +342,21 @@ function stubDriftedRuntime(blueprint: Blueprint, generationId: string, artifact
       failureClass: null,
       resolvedAt: 2,
     }],
+  });
+}
+
+/**
+ * A marker written before the generation fields existed, which is what every
+ * node upgraded from an older Sencho carries. It blocks a repair, because Sencho
+ * cannot prove what it would overwrite, and it says nothing at all about whether
+ * the workload is drifted.
+ */
+function stubLegacyMarker(blueprint: Blueprint): void {
+  vi.spyOn(BlueprintService.getInstance(), 'readMarker').mockResolvedValue({
+    blueprintId: blueprint.id,
+    revision: blueprint.revision,
+    lastApplied: Date.now(),
+    applicationId: store_app(blueprint),
   });
 }
 
@@ -528,7 +552,47 @@ describe('the runtime drift policy holds what it must not repair', () => {
     expect(deploymentOf(blueprint, node)?.status).toBe('repair_held');
   });
 
-  it('holds when the on-node marker names no generation to prove what is running', async () => {
+  it('leaves a legacy-marker target alone when there is no drift', async () => {
+    // A marker written before the generation fields existed proves nothing about
+    // which generation installed it, so Enforce may not repair from it. It does
+    // not mean the workload is unhealthy: a target with no drift has to stay
+    // active, or an upgrade marks the whole fleet as needing attention.
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'enforce');
+    const seeded = await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    // The matched-runtime stub stamps a current marker; overriding it afterwards
+    // is what makes this a legacy marker while leaving the healthy observation.
+    stubMatchedRuntime(blueprint, seeded.generationId, seeded.artifactSetId, seeded.rolloutGenerationId);
+    vi.spyOn(BlueprintService.getInstance(), 'readMarker').mockResolvedValue({
+      blueprintId: blueprint.id,
+      revision: blueprint.revision,
+      lastApplied: Date.now(),
+    });
+    const deploySpy = vi
+      .spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
+      .mockResolvedValue({ status: 'active' });
+
+    await tick(blueprint, node);
+
+    expect(deploySpy, 'nothing drifted, so nothing to repair').not.toHaveBeenCalled();
+    expect(deploymentOf(blueprint, node)?.status, 'a healthy target must not read as needing repair')
+      .toBe('active');
+    expect(GitOpsStore.getInstance().getTarget(seeded.appId, node.id)?.latest_stage)
+      .not.toBe('blueprint_repair_held');
+  });
+
+  it('still reports container drift on a legacy-marker target, and holds the repair', async () => {
+    // The other half of the same trap. Blocking the repair must not blind the
+    // detection: a stopped container is the drift an operator most needs to see,
+    // and returning the hold before the container check hid it on every
+    // Git-managed target in the fleet.
     const node = seedNode();
     const blueprint = seedBlueprint(node, 'enforce');
     await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
@@ -539,25 +603,29 @@ describe('the runtime drift policy holds what it must not repair', () => {
       applied_revision: blueprint.revision,
       last_deployed_at: Date.now(),
     });
-    // A marker written before the generation fields existed: it parses, and it
-    // proves nothing about which generation installed it.
     vi.spyOn(BlueprintService.getInstance(), 'readMarker').mockResolvedValue({
       blueprintId: blueprint.id,
       revision: blueprint.revision,
       lastApplied: Date.now(),
     });
     const svc = BlueprintService.getInstance() as unknown as {
-      containerHealth: () => Promise<{ kind: 'running' }>;
+      containerHealth: () => Promise<unknown>;
       observeRuntimeIdentity: () => Promise<import('../services/gitops/json').ObservedArtifactIdentity>;
     };
-    vi.spyOn(svc, 'containerHealth').mockResolvedValue({ kind: 'running' });
+    vi.spyOn(svc, 'containerHealth').mockResolvedValue({ kind: 'not_running', detail: 'no containers running for this blueprint' });
     const deploySpy = vi
       .spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
       .mockResolvedValue({ status: 'active' });
 
-    await tick(blueprint, node);
+    const result = await BlueprintService.getInstance().checkForDrift(blueprint, node);
 
-    expect(deploySpy).not.toHaveBeenCalled();
+    expect(result.kind, 'a stopped container is drift, whatever the marker says').toBe('drifted');
+    if (result.kind === 'drifted') {
+      expect(result.cause).toBe('container');
+      expect(result.repairBlock?.reason, 'but the repair is still not permitted').toBe('evidence_incomplete');
+    }
+    await tick(blueprint, node);
+    expect(deploySpy, 'the repair must not be attempted').not.toHaveBeenCalled();
     expect(deploymentOf(blueprint, node)?.status).toBe('repair_held');
   });
 
@@ -586,6 +654,56 @@ describe('the runtime drift policy holds what it must not repair', () => {
     await tick(blueprint, node);
     await tick(blueprint, node);
     expect(countHolds(), 'a hold that has not changed is not new news').toBe(1);
+  });
+
+  it('lets Enforce repair after a drift-mode-only edit, without a new approval', async () => {
+    // The whole point of Enforce is that it can act, and the edit that turns it on
+    // used to be the one edit guaranteed to stop it: changing the mode opened a
+    // rollout candidate, which invalidated the placement approval and superseded
+    // the live rollout generation, which held every target with nothing left to
+    // advance it. The mode is a policy choice, so it must not mint an intent.
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'suggest');
+    const seeded = await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    const store = GitOpsStore.getInstance();
+
+    const { commitBlueprintUpdate } = await import('../services/gitops/blueprintProducers');
+    commitBlueprintUpdate(blueprint.id, { drift_mode: 'enforce' }, 'tester', () => [node.id]);
+
+    // What decides whether Enforce can act is the target's own rollout pointer
+    // and that rollout generation still being live. (The application's pointer is
+    // written by the authorization transition, not by the update path, so it is
+    // not what a mode change can disturb.)
+    expect(store.getTarget(seeded.appId, node.id)?.rollout_generation_id)
+      .toBe(seeded.rolloutGenerationId);
+    expect(
+      store.getRolloutGeneration(seeded.rolloutGenerationId)?.superseded_at,
+      'a mode change must not supersede the rollout that owns the target',
+    ).toBeNull();
+    expect(DatabaseService.getInstance().getBlueprint(blueprint.id)?.drift_mode).toBe('enforce');
+
+    // And the mode now works: the drift is repaired on the next tick. Stubbed
+    // as artifact drift deliberately, so this exercises the digest path Enforce
+    // actually repairs through. Left unstubbed, the check would classify a
+    // missing marker instead and still reach the same mock, so the test would
+    // pass while proving nothing about the case it names.
+    stubDriftedRuntime(blueprint, seeded.generationId, seeded.artifactSetId, seeded.rolloutGenerationId);
+    const deploySpy = vi
+      .spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
+      .mockResolvedValue({ status: 'active' });
+    const current = DatabaseService.getInstance().getBlueprint(blueprint.id)!;
+
+    await tick(current, node);
+
+    expect(deploySpy, 'Enforce repairs once it is switched on').toHaveBeenCalledTimes(1);
+    expect(deploymentOf(current, node)?.status).not.toBe('repair_held');
   });
 
   it('re-checks a held target, so clearing the hold lets a later tick repair it', async () => {
@@ -624,6 +742,202 @@ describe('the runtime drift policy holds what it must not repair', () => {
     // The deploy is mocked, so it does not write the terminal row itself. What
     // matters here is that the target left the held state and entered a repair.
     expect(deploymentOf(blueprint, node)?.status).not.toBe('repair_held');
+  });
+
+  it('keeps the hold in the projection and the attention queue across ticks', async () => {
+    // The hold is recorded once and then suppressed, while the runtime
+    // observation stamps a stage on every check. So the observation used to
+    // overwrite the hold's stage on the very next tick, and from then on the
+    // deployment row said held while the projection and the attention queue said
+    // nothing was wrong. Evidence must not supersede a decision.
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'enforce');
+    const seeded = await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    stubDriftedRuntime(blueprint, seeded.generationId, seeded.artifactSetId, seeded.rolloutGenerationId);
+    const store = GitOpsStore.getInstance();
+    store.markRolloutGenerationSuperseded(seeded.rolloutGenerationId, Date.now());
+    vi.spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
+      .mockResolvedValue({ status: 'active' });
+
+    const { projectApplication } = await import('../services/gitops/derive');
+    const { attentionReasons } = await import('../services/gitops/attention');
+    const held = (): boolean => {
+      const target = projectApplication(seeded.appId, false);
+      const row = 'targets' in target ? target.targets[0] : undefined;
+      return row?.runtime.status === 'repair_held'
+        && attentionReasons(target).includes('repair_held');
+    };
+
+    await tick(blueprint, node);
+    expect(deploymentOf(blueprint, node)?.status).toBe('repair_held');
+    expect(held(), 'the hold is visible on the first tick').toBe(true);
+
+    await tick(blueprint, node);
+    await tick(blueprint, node);
+
+    expect(deploymentOf(blueprint, node)?.status, 'the row still says held').toBe('repair_held');
+    expect(
+      held(),
+      'the projection and attention queue must still say held on tick three, not just the row',
+    ).toBe(true);
+  });
+
+  it('carries a recovery hold through the Inline marker-missing path', async () => {
+    // The marker-missing path returns before the marker-generation check, so it
+    // used to hand the reconciler a repairable verdict. The reconciler then called
+    // deployToNode, which uses the binding only to stamp the marker and never
+    // refuses, so Enforce overwrote a target a recovery owned.
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'enforce');
+    const store = GitOpsStore.getInstance();
+    const appId = newGitOpsId();
+    store.insertApplication(blankInlineApplication(appId, blueprint.id, Date.now()));
+    const generationId = newGitOpsId();
+    const artifactSetId = newGitOpsId();
+    store.insertGeneration(inlineGenerationFixture(appId, blueprint.id, generationId));
+    store.insertArtifactSet({
+      id: artifactSetId,
+      generation_id: generationId,
+      evidence_version: 1,
+      authoritative: 0,
+      qualification: 'exact',
+      evidence_json: encodeArtifactEvidenceJson({
+        kind: 'exact',
+        identity: `exact:${DIGEST}`,
+        services: [service(DIGEST)],
+      }),
+      created_at: Date.now(),
+    });
+    const app = store.getApplication(appId)!;
+    app.accepted_generation_id = generationId;
+    app.artifact_set_id = artifactSetId;
+    app.latest_artifact_set_id = artifactSetId;
+    store.writeApplicationPointers(app);
+    store.upsertTarget({
+      ...emptyTargetRow(appId, node.id, Date.now()),
+      target_status: 'active',
+      desired_generation_id: generationId,
+      expected_artifact_set_id: artifactSetId,
+      latest_artifact_set_id: artifactSetId,
+      // A recovery owns this target, so no repair may be attempted.
+      recovery_phase: 'restoring',
+    });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    vi.spyOn(BlueprintService.getInstance(), 'readMarker').mockResolvedValue(null);
+    const svc = BlueprintService.getInstance() as unknown as {
+      containerHealth: () => Promise<{ kind: 'running' }>;
+    };
+    vi.spyOn(svc, 'containerHealth').mockResolvedValue({ kind: 'running' });
+
+    const result = await BlueprintService.getInstance().checkForDrift(blueprint, node);
+
+    // The block is the assertion here. The reconciler consults it before it
+    // reaches any mutation site, and the reconciler-level consequence is covered
+    // by the Git-managed cases below, which do run a full tick. An Inline
+    // Blueprint with no live placement approval is never ticked, so asserting a
+    // deployment did not happen against this fixture would pass vacuously.
+    expect(result.kind).toBe('drifted');
+    if (result.kind === 'drifted') {
+      expect(result.repairBlock?.reason, 'a recovery owns this target').toBe('recovery_bound');
+    }
+    const held = await BlueprintService.getInstance().enforceDigestRepair(blueprint, node);
+    expect(held.status, 'the repair entry points refuse the same target').toBe('repair_held');
+  });
+
+  it('holds a Git-managed revision mismatch on a legacy marker instead of overwriting it', async () => {
+    // The revision-mismatch return is the third early exit, and it dropped the
+    // block the marker-generation check had already set. Enforce then reapplied
+    // authorized content over a node whose marker proved nothing, which is
+    // exactly what the evidence_incomplete hold exists to prevent.
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'enforce');
+    await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    // Legacy marker: parses, names no generation, and is a revision behind.
+    vi.spyOn(BlueprintService.getInstance(), 'readMarker').mockResolvedValue({
+      blueprintId: blueprint.id,
+      revision: blueprint.revision - 1,
+      lastApplied: Date.now(),
+    });
+    const deploySpy = vi
+      .spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
+      .mockResolvedValue({ status: 'active' });
+
+    const result = await BlueprintService.getInstance().checkForDrift(blueprint, node);
+
+    expect(result.kind).toBe('drifted');
+    if (result.kind === 'drifted') {
+      expect(result.cause).toBe('revision');
+      expect(result.repairBlock?.reason).toBe('evidence_incomplete');
+    }
+    await tick(blueprint, node);
+    expect(deploySpy, 'the repair must not be attempted').not.toHaveBeenCalled();
+  });
+
+  it('writes one row per tick for a held target, not three', async () => {
+    // With the block dropped on the marker path, a held target went drifted,
+    // then correcting, then repair_held every tick. Because the previous status
+    // was no longer repair_held the dedupe never matched, so each tick appended
+    // three history rows and fired an alert.
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'enforce');
+    const seeded = await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    stubDriftedRuntime(blueprint, seeded.generationId, seeded.artifactSetId, seeded.rolloutGenerationId);
+    vi.spyOn(BlueprintService.getInstance(), 'readMarker').mockResolvedValue(null);
+    vi.spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
+      .mockResolvedValue({ status: 'active' });
+    const store = GitOpsStore.getInstance();
+    store.markRolloutGenerationSuperseded(seeded.rolloutGenerationId, Date.now());
+    const db = DatabaseService.getInstance().getDb();
+    // Counted by decision stage rather than across all of history, because the
+    // runtime observation is written on every check and would drown out the
+    // thing under test. The claim is that later ticks add evidence and no new
+    // decision, so the bound is exactly zero additional decisions.
+    const decisions = (): number => (db.prepare(
+      `SELECT COUNT(*) AS n FROM gitops_history
+        WHERE application_id = ? AND stage IN (
+          'blueprint_state_review', 'blueprint_evict_blocked', 'blueprint_drifted',
+          'blueprint_correcting', 'blueprint_repair_held', 'blueprint_drift_cleared'
+        )`,
+    ).get(seeded.appId) as { n: number }).n;
+
+    await tick(blueprint, node);
+    const afterFirst = decisions();
+    await tick(blueprint, node);
+    await tick(blueprint, node);
+
+    expect(
+      decisions() - afterFirst,
+      'later ticks add evidence, not a second round of decisions',
+    ).toBe(0);
+    expect(store.getTarget(seeded.appId, node.id)?.latest_stage).toBe('blueprint_repair_held');
+    expect(deploymentOf(blueprint, node)?.status).toBe('repair_held');
   });
 
   it('advances the projection when a hold clears without a repair', async () => {
@@ -667,14 +981,124 @@ describe('the runtime drift policy holds what it must not repair', () => {
     // optional chain here would make the whole case pass on a missing target,
     // which is the failure this test exists to catch.
     expect(target, 'the target must be projected, or this case proves nothing').toBeDefined();
-    // Asserted on the stage, not only the derived status: the same check also
-    // records the observed artifact, which advances the stage on its own, so the
-    // derived status alone is identical with and without the clearing
-    // observation. The stage is what this commit is actually about.
+    // The clearing observation is recorded, and the derived status is the honest
+    // "deployed, no health verdict claimed" one: a matched drift check is not a
+    // health verdict and must not read as one.
     expect(store.getTarget(seeded.appId, node.id)?.latest_stage).toBe('blueprint_drift_cleared');
-    // A matched drift check is not a health verdict, so it must not read as
-    // synced-and-healthy. It reads as deployed with no health claim instead.
     expect(target?.runtime.status).toBe('fully_deployed_health_pending');
+  });
+
+  it('reaches synced and healthy once a cleared target is ticked again', async () => {
+    // Clearing is not a decision, so nothing later preserves it. If the clearing
+    // stage were treated as one, every recovered target would sit on "deployed,
+    // health pending" for good and the portfolio would report a healthy
+    // application as in progress until the next rollout.
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'enforce');
+    const seeded = await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    stubMatchedRuntime(blueprint, seeded.generationId, seeded.artifactSetId, seeded.rolloutGenerationId);
+    const store = GitOpsStore.getInstance();
+    store.upsertTarget({
+      ...store.getTarget(seeded.appId, node.id)!,
+      connectivity: 'unreachable',
+    });
+    vi.spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
+      .mockResolvedValue({ status: 'active' });
+
+    const { projectApplication } = await import('../services/gitops/derive');
+    const runtimeStatus = (): string | undefined => {
+      const projected = projectApplication(seeded.appId, false);
+      const row = 'targets' in projected ? projected.targets[0] : undefined;
+      return row?.runtime.status;
+    };
+
+    await tick(blueprint, node);
+    expect(deploymentOf(blueprint, node)?.status).toBe('repair_held');
+    // The node comes back and its workload was already correct, so the hold
+    // clears rather than repairing anything.
+    store.upsertTarget({
+      ...store.getTarget(seeded.appId, node.id)!,
+      connectivity: 'reachable',
+    });
+    await tick(blueprint, node);
+    expect(deploymentOf(blueprint, node)?.status).toBe('active');
+    expect(store.getTarget(seeded.appId, node.id)?.latest_stage).toBe('blueprint_drift_cleared');
+
+    await tick(blueprint, node);
+
+    // The stage is the assertion, because it is what the fix moves. The derived
+    // status is not: a Blueprint target with no health verdict reads
+    // "deployed, health pending" from the pointer path whether or not the cleared
+    // stage is still there, so it cannot tell the two apart. What must not happen
+    // is the clearing stage surviving, because the projection reads it ahead of
+    // everything else and nothing else ever moves it on.
+    expect(
+      store.getTarget(seeded.appId, node.id)?.latest_stage,
+      'clearing is not a standing decision, so the next observation moves past it',
+    ).not.toBe('blueprint_drift_cleared');
+    expect(runtimeStatus()).toBeDefined();
+  });
+
+  it('alerts and records drift in Suggest mode even when the Blueprint is stateful', async () => {
+    // The classification hold is a decision about auto-repair. Suggest is the
+    // mode whose whole point is to tell the operator about drift and let them
+    // decide, so a stateful Blueprint used to be silently downgraded to a hold
+    // that fired no alert at all, which is the opposite of what was asked for.
+    const { NotificationService } = await import('../services/NotificationService');
+    const alertSpy = vi
+      .spyOn(NotificationService.getInstance(), 'dispatchAlert')
+      .mockResolvedValue({ persisted: true });
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'suggest', 'stateful');
+    const seeded = await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    stubDriftedRuntime(blueprint, seeded.generationId, seeded.artifactSetId, seeded.rolloutGenerationId);
+    const deploySpy = vi
+      .spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
+      .mockResolvedValue({ status: 'active' });
+
+    await tick(blueprint, node);
+
+    expect(deploySpy, 'Suggest never auto-fixes').not.toHaveBeenCalled();
+    expect(deploymentOf(blueprint, node)?.status, 'the drift is reported, not held').toBe('drifted');
+    expect(alertSpy).toHaveBeenCalledWith(
+      'warning',
+      'blueprint_drift_detected',
+      expect.stringContaining('drifted'),
+      expect.anything(),
+    );
+  });
+
+  it('records drift in Observe mode without claiming auto-fix was declined', async () => {
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'observe', 'stateful');
+    const seeded = await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    stubDriftedRuntime(blueprint, seeded.generationId, seeded.artifactSetId, seeded.rolloutGenerationId);
+
+    await tick(blueprint, node);
+
+    expect(deploymentOf(blueprint, node)?.status).toBe('drifted');
+    expect(deploymentOf(blueprint, node)?.drift_summary ?? '').not.toMatch(/auto-fix is declined/i);
   });
 
   it('never mutates in Observe mode', async () => {
@@ -781,6 +1205,91 @@ describe('artifact uncertainty blocks a repair', () => {
     const deployment = deploymentOf(blueprint, node);
     expect(deployment?.status).not.toBe('drifted');
     expect(deployment?.status).not.toBe('repair_held');
+  });
+
+  it('does not hold an Enforce target on a legacy marker alone when the check cannot classify', async () => {
+    // The upgrade case. Every Enforce target whose marker predates the generation
+    // fields blocks its repair, and if that block also reported a hold, any tick
+    // the check could not classify would put a target with no proven drift into
+    // Repair held and alert that an auto-fix was declined. None was due: an
+    // unverified result never attempts a repair, so there is nothing to hold off.
+    const { NotificationService } = await import('../services/NotificationService');
+    const alertSpy = vi
+      .spyOn(NotificationService.getInstance(), 'dispatchAlert')
+      .mockResolvedValue({ persisted: true });
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'enforce');
+    await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    stubLegacyMarker(blueprint);
+    const svc = BlueprintService.getInstance() as unknown as {
+      containerHealth: () => Promise<{ kind: 'unreachable'; detail: string }>;
+    };
+    vi.spyOn(svc, 'containerHealth').mockResolvedValue({ kind: 'unreachable', detail: 'the node did not answer' });
+    const deploySpy = vi
+      .spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
+      .mockResolvedValue({ status: 'active' });
+
+    await tick(blueprint, node);
+
+    const deployment = deploymentOf(blueprint, node);
+    expect(deployment?.status, 'an unclassifiable check is not a hold').toBe('active');
+    expect(deploySpy, 'and nothing may be written to the node').not.toHaveBeenCalled();
+    expect(
+      alertSpy.mock.calls.filter((call) => call[1] === 'blueprint_drift_repair_held'),
+      'no auto-fix was due, so declining one must not be announced',
+    ).toHaveLength(0);
+  });
+
+  it('does not hold an Enforce target on a legacy marker alone when the build cannot be identified', async () => {
+    // The same upgrade case on the tick where the node answers but the running
+    // image is a local build with no comparable digest. This one is permanent
+    // rather than a transient blip, so without the split it would hold the target
+    // for good and keep re-alerting.
+    const { NotificationService } = await import('../services/NotificationService');
+    const alertSpy = vi
+      .spyOn(NotificationService.getInstance(), 'dispatchAlert')
+      .mockResolvedValue({ persisted: true });
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'enforce');
+    await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    stubLegacyMarker(blueprint);
+    const svc = BlueprintService.getInstance() as unknown as {
+      containerHealth: () => Promise<{ kind: 'running' }>;
+      observeRuntimeIdentity: () => Promise<import('../services/gitops/json').ObservedArtifactIdentity>;
+    };
+    vi.spyOn(svc, 'containerHealth').mockResolvedValue({ kind: 'running' });
+    vi.spyOn(svc, 'observeRuntimeIdentity').mockResolvedValue({
+      kind: 'local_build_unverified',
+      identity: 'local:img-1',
+      observedAt: Date.now(),
+    });
+    const deploySpy = vi
+      .spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
+      .mockResolvedValue({ status: 'active' });
+
+    await tick(blueprint, node);
+
+    expect(deploymentOf(blueprint, node)?.status, 'an unidentifiable build is uncertainty, not a hold')
+      .toBe('active');
+    expect(deploySpy, 'and nothing may be written to the node').not.toHaveBeenCalled();
+    expect(
+      alertSpy.mock.calls.filter((call) => call[1] === 'blueprint_drift_repair_held'),
+      'no auto-fix was due, so declining one must not be announced',
+    ).toHaveLength(0);
   });
 
   it('holds when the target\'s expectation no longer matches what the rollout authorized', async () => {
@@ -948,22 +1457,26 @@ describe('local and remote targets reach the same decision', () => {
 });
 
 describe('the Inline content path', () => {
-  it('holds an Inline Blueprint whose target never acknowledged a generation', async () => {
+  it('holds an Inline target that never acknowledged a generation', () => {
+    // Asserted on the binding rather than on a repair entry point, because that
+    // is where the decision is made and therefore what the dispatch consults. An
+    // Inline blueprint repairs through deployToNode, and enforceDigestRepair is
+    // the Git-managed content-digest path, so pinning this to either method
+    // would have been testing a route the reconciler does not take here.
     const node = seedNode();
     const blueprint = seedBlueprint(node, 'enforce');
     const store = GitOpsStore.getInstance();
     const appId = newGitOpsId();
     store.insertApplication(blankInlineApplication(appId, blueprint.id, Date.now()));
     store.upsertTarget(emptyTargetRow(appId, node.id, Date.now()));
-    const deploySpy = vi
-      .spyOn(BlueprintService.getInstance(), 'deployAuthorizedMaterialization')
-      .mockResolvedValue({ status: 'active' });
+    const app = store.getApplication(appId)!;
 
-    const outcome = await BlueprintService.getInstance().enforceDigestRepair(blueprint, node);
+    const binding = resolveRuntimeRepairBinding(store, app, store.getTarget(appId, node.id));
 
-    expect(outcome.status).toBe('repair_held');
-    expect(outcome.holdReason).toBe('evidence_incomplete');
-    expect(deploySpy).not.toHaveBeenCalled();
+    expect(
+      binding.kind === 'hold' ? binding.reason : `a binding to ${binding.acceptedGenerationId}`,
+      'a target with nothing acknowledged must not be given a repair identity',
+    ).toBe('evidence_incomplete');
   });
 
   it('still classifies drift when an Inline target carries a disagreeing rollout generation', async () => {
@@ -1079,9 +1592,55 @@ describe('the Inline content path', () => {
 
     const result = await BlueprintService.getInstance().checkForDrift(blueprint, node);
 
-    expect(result.kind, 'a superseded rollout holds the repair').toBe('held');
+    // A superseded rollout leaves no authority to compare against, so the check
+    // cannot classify the artifact question. It is unverified, carrying the
+    // block, and the observation it did take is still recorded.
+    expect(result.kind).toBe('unverified');
+    if (result.kind === 'unverified') {
+      expect(result.repairBlock?.reason).toBe('rollout_superseded');
+    }
     const observed = store.getTarget(seeded.appId, node.id)?.observed_artifact_identity_json ?? null;
     expect(observed, 'a held target must still report what it is running').not.toBeNull();
     expect(observed).toContain(MOVED_DIGEST);
+  });
+
+  it('keeps the hold on a later unverified return, not just the first', async () => {
+    // The block has to travel with every return made after it is resolved, not
+    // only the one that happens to sit next to the resolution. The reconciler
+    // records its hold off this result, so a return that dropped the block would
+    // unhold the target for exactly as long as the node stays unobservable,
+    // which is the state a hold most needs to cover.
+    const node = seedNode();
+    const blueprint = seedBlueprint(node, 'enforce');
+    const seeded = await seedDeployedGitManaged({ blueprint, node, compose: COMPOSE });
+    DatabaseService.getInstance().upsertDeployment({
+      blueprint_id: blueprint.id,
+      node_id: node.id,
+      status: 'active',
+      applied_revision: blueprint.revision,
+      last_deployed_at: Date.now(),
+    });
+    stubDriftedRuntime(blueprint, seeded.generationId, seeded.artifactSetId, seeded.rolloutGenerationId);
+    const store = GitOpsStore.getInstance();
+    store.markRolloutGenerationSuperseded(seeded.rolloutGenerationId, Date.now());
+    // The node goes away after the marker was read, so the check bails out on
+    // the way to classifying it: a return that is neither the resolution's own
+    // arm nor a drifted one. Spied rather than assigned, because a direct
+    // assignment on the singleton outlives this test and would leave every later
+    // one in the file looking at an unreachable node.
+    const svc = BlueprintService.getInstance() as unknown as {
+      containerHealth: () => Promise<{ kind: 'unreachable'; detail: string }>;
+    };
+    vi.spyOn(svc, 'containerHealth')
+      .mockResolvedValue({ kind: 'unreachable', detail: 'the node did not answer' });
+
+    const result = await BlueprintService.getInstance().checkForDrift(blueprint, node);
+
+    expect(result.kind, 'an unreachable node cannot be classified').toBe('unverified');
+    if (result.kind !== 'unverified') throw new Error('expected an unverified result');
+    expect(
+      result.repairBlock?.reason,
+      'a hold must not lapse just because the node became unobservable',
+    ).toBe('rollout_superseded');
   });
 });

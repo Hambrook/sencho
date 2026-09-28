@@ -128,6 +128,34 @@ export type BlueprintObservationStage =
   | 'blueprint_drift_cleared';
 
 /**
+ * Stages that record a decision someone still has to act on.
+ *
+ * These survive the evidence that is gathered after them, because evidence
+ * cannot answer for a decision: a target awaiting state review, or one whose
+ * drift is still there or still declined, must not be talked out of it by the
+ * next runtime observation.
+ *
+ * `blueprint_drift_cleared` is deliberately absent. It records that a drift is
+ * *gone*, which is the absence of a standing decision rather than one, and it
+ * projects to "deployed, health pending" so that nothing claims a health verdict
+ * the check did not make. Preserving it pinned every recovered target there
+ * forever, because nothing later moves it on: the portfolio then reported a
+ * healthy application as in progress until the next rollout.
+ */
+const STANDING_BLUEPRINT_DECISIONS: ReadonlySet<string> = new Set<BlueprintObservationStage>([
+  'blueprint_state_review',
+  'blueprint_evict_blocked',
+  'blueprint_drifted',
+  'blueprint_correcting',
+  'blueprint_repair_held',
+]);
+
+/** Whether a stored stage is a decision still waiting on someone. */
+function isStandingBlueprintDecision(stage: string | null): boolean {
+  return stage !== null && STANDING_BLUEPRINT_DECISIONS.has(stage);
+}
+
+/**
  * What a health run claimed inside a recovery transaction reported back.
  *
  * `replayed` means the recovery already owned a run, so the caller arms that
@@ -876,6 +904,13 @@ export class GitOpsTransitions {
         target.observed_artifact_identity_json = observedJson;
         return { before, after: { observedArtifactIdentityJson: observedJson } };
       },
+      'committed',
+      // Evidence does not supersede a decision that is still waiting on someone.
+      // This runs on every drift check, and the projection reads `latest_stage`,
+      // so letting it overwrite a hold made the hold vanish from the projection
+      // on the tick after it was recorded: the deployment row still said held
+      // while every GitOps surface said otherwise.
+      { keepStandingDecision: true },
     );
   }
 
@@ -4061,6 +4096,11 @@ export class GitOpsTransitions {
       app: GitOpsApplicationRow,
     ) => { before: Record<string, unknown>; after: Record<string, unknown> },
     outcome: HistoryOutcome = 'committed',
+    // A transition that only records evidence can ask to leave a standing
+    // decision alone. The projection reads `latest_stage` and maps observation
+    // stages onto the runtime status, so a stage that maps to nothing (an
+    // artifact observation) would otherwise silently drop a hold.
+    options: { keepStandingDecision?: boolean } = {},
   ): TransitionResult {
     return this.raw().transaction(() => {
       const app = this.requireApp(applicationId);
@@ -4082,7 +4122,9 @@ export class GitOpsTransitions {
       // target by some other route would silently erase a drift the reconciler
       // will not re-record, because it only records an observation when the
       // deployment status moves.
-      target.latest_stage = stage;
+      if (!(options.keepStandingDecision && isStandingBlueprintDecision(target.latest_stage))) {
+        target.latest_stage = stage;
+      }
       target.updated_at = envelope.at;
       this.store().upsertTarget(target);
       const historyId = this.history(app, envelope, {
