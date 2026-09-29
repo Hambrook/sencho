@@ -14,6 +14,7 @@ import request from 'supertest';
 import { setupTestDb, cleanupTestDb, loginAsTestAdmin } from './helpers/setupTestDb';
 import { directApplicationFixture } from './helpers/gitopsFixtures';
 import { commitBlueprintCreate } from '../services/gitops/blueprintProducers';
+import { emptyTargetRow } from '../services/gitops/store';
 import {
   encodeArtifactEvidenceJson,
   encodeGitOpsApprovedTargetEffectJson,
@@ -38,6 +39,8 @@ let GitSourceService: typeof import('../services/GitSourceService').GitSourceSer
 let setRegistryReadinessDepsForTests: typeof import('../services/gitops/handoff').setRegistryReadinessDepsForTests;
 let adminCookie: string;
 let viewerCookie: string;
+let scopedCookie: string;
+let deployerCookie: string;
 
 function registryReadyTestDeps() {
   return {
@@ -254,17 +257,50 @@ function seedGitManagedBlueprint(opts: { sourceAccepted: boolean; nodeCount?: nu
       created_at: 1,
     });
   }
+  // Target rows, because a Blueprint application that has an approved placement
+  // has targets, and every policy write resolves its target set from them. A
+  // fixture with none leaves the rollout lifecycle writes authorizing on an empty
+  // set, which is the one shape that cannot tell a per-target grant from an
+  // application-wide one.
+  for (const nodeId of nodeIds) {
+    store.upsertTarget({ ...emptyTargetRow(applicationId, nodeId, Date.now()), target_status: 'active' });
+  }
   return { blueprintId: blueprint.id, applicationId, intentId, candidateId, generationId, nodeIds };
 }
 
-async function seedAndLoginRole(username: string, password: string, role: 'viewer'): Promise<string> {
+/**
+ * A scoped operator for the policy writes: no `stack:deploy` of their own, just a
+ * grant on one stack and node.
+ *
+ * The only persona that can tell the per-target check from the application-wide
+ * one. A role-based deployer passes either way, because a role grant is global
+ * within its action, and a caller with neither is refused either way.
+ */
+function scopeRolesToTarget(seeded: Seeded, nodeId: number, roles: readonly string[]): void {
+  const db = DatabaseService.getInstance();
+  // Read off the intent rather than rebuilt from the fixture's naming, so the
+  // assignment cannot silently drift from the stack the route authorizes against.
+  const stackName = GitOpsStore.getInstance().getIntentRevision(seeded.intentId)!.deploy_stack_name;
+  const userId = db.getUserByUsername('auth-scoped')!.id;
+  // A stack assignment is node-qualified by the table's own CHECK.
+  const insert = db.getDb().prepare(
+    `INSERT INTO role_assignments (user_id, role, resource_type, resource_id, node_id, created_at)
+     VALUES (?, ?, 'stack', ?, ?, ?)`,
+  );
+  roles.forEach((role, index) => insert.run(userId, role, stackName, nodeId, Date.now() + index));
+}
+
+async function seedAndLoginRole(
+  username: string,
+  password: string,
+  role: 'viewer' | 'deployer',
+): Promise<string> {
   const passwordHash = await bcrypt.hash(password, 1);
   DatabaseService.getInstance().addUser({ username, password_hash: passwordHash, role });
   const res = await request(app).post('/api/auth/login').send({ username, password });
   const cookies = res.headers['set-cookie'] as string | string[];
   return Array.isArray(cookies) ? cookies[0] : cookies;
 }
-
 beforeAll(async () => {
   tmpDir = await setupTestDb();
   ({ DatabaseService } = await import('../services/DatabaseService'));
@@ -276,6 +312,13 @@ beforeAll(async () => {
   ({ app } = await import('../index'));
   adminCookie = await loginAsTestAdmin(app);
   viewerCookie = await seedAndLoginRole('auth-viewer', 'auth-viewer-pass', 'viewer');
+  // A `viewer` globally, so every grant it holds is a scoped assignment. The
+  // scoped policy-write cases below are the only ones that can distinguish a
+  // per-target grant from the application-wide one.
+  scopedCookie = await seedAndLoginRole('auth-scoped', 'auth-scoped-pass', 'viewer');
+  // A role grant is global within its action, which is what the empty target set
+  // falls back to.
+  deployerCookie = await seedAndLoginRole('auth-deployer', 'auth-deployer-pass', 'deployer');
   vi.spyOn(LicenseService.getInstance(), 'getTier').mockReturnValue('community');
 });
 
@@ -411,6 +454,127 @@ describe('POST /api/gitops/applications/:id/rollout/health-policy', () => {
     const after = GitOpsStore.getInstance().getIntentRevision(seeded.intentId)!
       .health_failure_rollback_policy_json;
     expect(after).toBe(before);
+  });
+
+  it('lets an operator whose deploy grant covers the target set it', async () => {
+    // The per-target branch, which the empty target set could never reach: a
+    // caller holding no application-wide grant is authorized because every
+    // target it names is a stack it can deploy to.
+    const seeded = seedGitManagedBlueprint({ sourceAccepted: true });
+    scopeRolesToTarget(seeded, seeded.nodeIds[0]!, ['deployer', 'auditor']);
+
+    const res = await request(app)
+      .post(`/api/gitops/applications/${applicationOf(seeded.blueprintId)}/rollout/health-policy`)
+      .set('Cookie', scopedCookie)
+      .send({ policy: 'pause' });
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(
+      GitOpsStore.getInstance().getIntentRevision(seeded.intentId)!.health_failure_rollback_policy_json!,
+    )).toEqual({ policy: 'pause' });
+  });
+
+  it('refuses an operator scoped to only some of the targets', async () => {
+    // The same grant, on an application with a second target the assignment does
+    // not name. A health policy decides what the system may do to each target's
+    // stack, so a caller entitled to set it for one node and not another is
+    // refused outright rather than half-applied.
+    const seeded = seedGitManagedBlueprint({ sourceAccepted: true, nodeCount: 2 });
+    expect(seeded.nodeIds).toHaveLength(2);
+    // The grant names the first target only, so the second is what the write is
+    // refused over. The caller is a global viewer, so it can read the application
+    // and is refused only on the deploy authority the per-target loop requires.
+    scopeRolesToTarget(seeded, seeded.nodeIds[0]!, ['deployer']);
+
+    const res = await request(app)
+      .post(`/api/gitops/applications/${applicationOf(seeded.blueprintId)}/rollout/health-policy`)
+      .set('Cookie', scopedCookie)
+      .send({ policy: 'pause' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('PERMISSION_DENIED');
+    expect(GitOpsStore.getInstance().getIntentRevision(seeded.intentId)!
+      .health_failure_rollback_policy_json).toBeNull();
+  });
+
+  it('needs the application-wide grant when there is no target to check', async () => {
+    // The empty-set branch. Nothing is placed yet, so there is no per-target grant
+    // to resolve and the write falls back to the application-wide one. A loop over
+    // no targets would otherwise authorize the write on its own absence.
+    //
+    // The caller holds no deploy grant anywhere, so this is the refusal the branch
+    // exists to produce rather than one about which targets a grant happens to
+    // name. The paired case below shows the same application admitting a caller
+    // who does hold that grant.
+    const seeded = seedGitManagedBlueprint({ sourceAccepted: true, nodeCount: 0 });
+    expect(GitOpsStore.getInstance().listTargets(seeded.applicationId)).toEqual([]);
+    const res = await request(app)
+      .post(`/api/gitops/applications/${applicationOf(seeded.blueprintId)}/rollout/health-policy`)
+      .set('Cookie', scopedCookie)
+      .send({ policy: 'pause' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('PERMISSION_DENIED');
+    expect(GitOpsStore.getInstance().getIntentRevision(seeded.intentId)!
+      .health_failure_rollback_policy_json).toBeNull();
+  });
+
+  it('refuses a grant naming a different node than the only target', async () => {
+    // The one-target version of the same refusal, and the shape a single-node
+    // rollout actually has. A grant scoped to another node is not a grant on this
+    // target, whatever else it covers.
+    const seeded = seedGitManagedBlueprint({ sourceAccepted: true });
+    expect(seeded.nodeIds).toHaveLength(1);
+    const otherNode = insertNode(`auth-node-elsewhere-${randomUUID().slice(0, 8)}`);
+    scopeRolesToTarget(seeded, otherNode, ['deployer']);
+
+    const res = await request(app)
+      .post(`/api/gitops/applications/${applicationOf(seeded.blueprintId)}/rollout/health-policy`)
+      .set('Cookie', scopedCookie)
+      .send({ policy: 'pause' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('PERMISSION_DENIED');
+    expect(GitOpsStore.getInstance().getIntentRevision(seeded.intentId)!
+      .health_failure_rollback_policy_json).toBeNull();
+  });
+
+  it('refuses a read-only grant, so seeing the policy is not authority over it', async () => {
+    // The read half of the scoped persona, on its own. Read access is what lets
+    // the policy control render at all, and this is the case that shows it is not
+    // also the authority to set it: the same stack and node, granted only the read.
+    const seeded = seedGitManagedBlueprint({ sourceAccepted: true });
+    scopeRolesToTarget(seeded, seeded.nodeIds[0]!, ['auditor']);
+
+    const res = await request(app)
+      .post(`/api/gitops/applications/${applicationOf(seeded.blueprintId)}/rollout/health-policy`)
+      .set('Cookie', scopedCookie)
+      .send({ policy: 'pause' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('PERMISSION_DENIED');
+    expect(GitOpsStore.getInstance().getIntentRevision(seeded.intentId)!
+      .health_failure_rollback_policy_json).toBeNull();
+  });
+
+  it('lets a role-based deployer through with no target to check', async () => {
+    // The other half of the empty-set branch. With nothing placed there is no
+    // per-target grant to resolve, and the fallback is an application-wide check
+    // that names no resource at all, so only a role can satisfy it. A scoped
+    // assignment cannot, which is why the case beside this one refuses one, and
+    // both are the same branch seen from the two sides it has to serve.
+    const seeded = seedGitManagedBlueprint({ sourceAccepted: true, nodeCount: 0 });
+    expect(GitOpsStore.getInstance().listTargets(seeded.applicationId)).toEqual([]);
+
+    const res = await request(app)
+      .post(`/api/gitops/applications/${applicationOf(seeded.blueprintId)}/rollout/health-policy`)
+      .set('Cookie', deployerCookie)
+      .send({ policy: 'pause' });
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(
+      GitOpsStore.getInstance().getIntentRevision(seeded.intentId)!.health_failure_rollback_policy_json!,
+    )).toEqual({ policy: 'pause' });
   });
 });
 

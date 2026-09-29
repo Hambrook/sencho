@@ -1,6 +1,7 @@
 import { GitOpsStore } from './store';
 import { GitOpsTransitions, type TransitionResult } from './transitions';
 import { restoreTargetToGeneration } from './rolloutRecovery';
+import { healthHoldReason } from './healthPolicy';
 import { ROLE_PERMISSIONS, type PermissionAction } from '../../middleware/permissions';
 import { sanitizeForLog } from '../../utils/safeLog';
 
@@ -296,11 +297,15 @@ function holdRollout(
   decision: { reason: string },
   envelope: { operationId: string; actor: string; trigger: string; at: number },
 ): void {
+  // A hold the transition already recorded is left alone, which is the case for
+  // an unacked attempt: there the pause is written in the same transaction as
+  // the fence, because a target that never acked has no rollout pointer for the
+  // fence to be scoped to.
   if (GitOpsStore.getInstance().getApplication(applicationId)?.pause_at) return;
   GitOpsTransitions.getInstance().rolloutPaused(
     applicationId,
     null,
-    `Held by the health rollout policy (${decision.reason.replace(/_/g, ' ')}).`,
+    healthHoldReason(decision.reason),
     envelope,
   );
 }
@@ -310,10 +315,12 @@ type HealthVerdictSink = (args: {
   nodeId: number;
   result: TransitionResult;
   /**
-   * Set when a run finished without a decision because it belonged to a rollout
-   * the application has left. The run is released, so whatever was waiting on it
-   * is now free, and the live rollout has to be driven again: nothing else would,
-   * because a verdict with no decision produces no follow-up of its own.
+   * Set when a run finished without a decision but released a target the live
+   * rollout was waiting on: a run belonging to a rollout the application has left,
+   * or a verdict that could not be attributed to what the target is running. The run
+   * is released, so whatever was waiting on it is now free, and the live rollout has
+   * to be driven again: nothing else would, because a verdict with no decision
+   * produces no follow-up of its own.
    */
   redrive?: boolean;
 }) => Promise<HealthRolloutOutcome>;
