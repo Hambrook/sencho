@@ -42,6 +42,7 @@ import {
     commitBlueprintDeploymentCause,
     commitBlueprintDeploymentRemoved,
     freezeInlineRevisionAfterDeploy,
+    retryInlineArtifactFreeze,
     type BlueprintDeploymentCause,
 } from './gitops/blueprintDeploymentProducers';
 import {
@@ -72,11 +73,57 @@ import {
 } from './gitops/runtimeRepairBinding';
 import { GitOpsTransitions } from './gitops/transitions';
 import { envelopeFor, recordableApplication } from './gitops/blueprintProducers';
-import type { GitOpsApplicationRow, GitOpsGenerationRow } from './gitops/types';
+import type {
+    GitOpsApplicationRow,
+    GitOpsArtifactSetRow,
+    GitOpsGenerationRow,
+} from './gitops/types';
 
 /** On-disk compose name for Blueprint applies. Must match createStack scaffold and Sencho discovery priority. */
 const COMPOSE_FILENAME = 'compose.yaml';
 const REMOTE_HTTP_TIMEOUT_MS = 30_000;
+
+/**
+ * Artifact qualifications a drift check re-resolves.
+ *
+ * `stale` is absent on purpose: it means a tag moved after the generation was
+ * accepted, and resolving toward that is the acceptance this path is not allowed
+ * to make. `local_build_unverified` is absent because a locally built service
+ * never resolves to a published digest, so a retry could not succeed; that
+ * absence is also what ends the loop for a build-only stack, whose expected
+ * pointer stays `unresolved` for the generation's whole life.
+ */
+const RETRYABLE_ARTIFACT_QUALIFICATIONS: ReadonlySet<GitOpsArtifactSetRow['qualification']> = new Set([
+    'unresolved',
+    'unavailable',
+]);
+
+/**
+ * Per-service failure classes a retry can actually clear.
+ *
+ * The qualification alone is too coarse to gate on: `unsupported_registry` and
+ * `platform_ambiguity` are properties of the authored reference, not of the
+ * registry's mood, so a set carrying either will resolve to the same answer
+ * forever. Retrying them burns registry traffic and appends an evidence row per
+ * attempt to a table nothing prunes, while the caveat promises a clearing that
+ * cannot arrive. `unresolved` is included because a service with no declared
+ * image genuinely may gain one when the Blueprint is edited, and `unresolved`
+ * on the whole set is also what a not-yet-attempted freeze produces.
+ *
+ * `platform_unavailable` is the one that matters for remote nodes: it means the
+ * node could not answer when asked, which is transient, and it is deliberately
+ * distinct from `platform_ambiguity`, which means the leaf is too old to be asked
+ * at all. Collapsing them permanently disabled the retry for a remote target
+ * after a single timeout.
+ */
+const RETRYABLE_SERVICE_FAILURES: ReadonlySet<ServiceArtifactEvidence['failureClass']> = new Set([
+    'registry_unavailable',
+    'credential_failure',
+    'digest_unavailable',
+    'stale_resolution',
+    'platform_unavailable',
+    'unresolved',
+]);
 
 export type DriftCause = 'revision' | 'container' | 'digest';
 
@@ -933,7 +980,35 @@ export class BlueprintService {
                 !expectedRow
                 || (expectedRow.qualification !== 'exact' && expectedRow.qualification !== 'qualified')
             ) {
-                return unverified('expected artifact set is not comparable');
+                // The freeze could not resolve an identity when it ran, so this
+                // target has nothing approved to compare against until a resolve
+                // succeeds. Today only the next deploy of this revision produces
+                // one, which makes an unrelated redeploy the price of proving what
+                // is running. The freeze cannot simply be re-run to fix that: it
+                // is keyed to the revision and short-circuits once a generation
+                // exists, so retrying means re-resolving the generation that is
+                // already frozen.
+                const retried = await this.retryArtifactFreeze(
+                    blueprint, node, app.id, binding, expectedRow,
+                );
+                if (!retried) {
+                    return unverified('expected artifact set is not comparable');
+                }
+                // The expectation the retry just produced has not been reviewed
+                // by anyone, and Enforce would act on it this same tick. A
+                // resolve that resolves a tag which moved while the identity was
+                // unproven would otherwise let Enforce redeploy the node onto a
+                // digest no approval ever saw, which is precisely the automatic
+                // advancement a retry must not cause.
+                //
+                // So the tick that produces the expectation declines to judge by
+                // it. What that buys is exactly one reconciler interval and no
+                // more: the next tick compares against the new expectation and,
+                // if the tag moved, reports drift that Enforce will repair. It is
+                // a delay, not an approval gate, and it does not hand an operator
+                // a review window. Claiming otherwise here would be the kind of
+                // comment that makes a reader believe a hold exists.
+                return unverified('expected artifact set resolved on this pass, awaiting a settled comparison');
             }
             let expectedIdentity: string | null = null;
             let expectedServices: ServiceArtifactEvidence[] | undefined;
@@ -968,6 +1043,186 @@ export class BlueprintService {
             // Prefer unverified over drifted so a transport failure cannot
             // trigger Enforce against an unreachable or half-observed node.
             return unverified(BlueprintService.formatError(err));
+        }
+    }
+
+    /**
+     * Generations whose retry has been refused, keyed `applicationId:nodeId`.
+     *
+     * A refusal is a statement about the authored content, so it stays true for
+     * that generation no matter how many times it is asked. Without this the
+     * refusal is re-derived on every reconcile tick: a refusal writes no evidence
+     * row, so the latest row's stamp never moves, the throttle never closes, and
+     * an unmodellable Blueprint would be re-parsed and re-logged every minute
+     * forever. Remembering the generation is enough because anything that could
+     * change the answer (an edit, a redeploy) mints a new one, and the deploy path
+     * resolves from the rendered model without consulting this.
+     *
+     * In memory on purpose: the worst case after a restart is one redundant
+     * refusal per affected target, which is not worth a persisted contract.
+     */
+    private readonly refusedFreezeRetries = new Map<string, string>();
+
+    /**
+     * Whether the recorded failure is one a retry can clear.
+     *
+     * Read from the evidence of the row that was actually recorded last, not from
+     * the expected set. The distinction is the whole reason this gate works: a
+     * resolve that fails records a fresh row that does **not** advance the
+     * expected pointer (`allowedExpectedAdvance` refuses anything but
+     * exact/qualified), so a gate keyed to the expected set reads the original
+     * freeze placeholder forever and re-tries a permanently failed resolve every
+     * interval. A build-only stack is the sharpest case: its expected set stays
+     * `unresolved` for the generation's whole life, while every recorded row says
+     * `local_build_unverified`, which no retry can ever change.
+     *
+     * Decoded from per-service evidence rather than inferred from the
+     * qualification alone, because the qualification collapses distinct causes.
+     * A set whose services all failed permanently is skipped: retrying it would
+     * re-derive the same answer on every interval, spend registry traffic, and
+     * append an evidence row each time to a table nothing prunes, while telling
+     * the operator it will clear.
+     *
+     * A set with no per-service evidence at all is retried. That is what the
+     * freeze placeholder looks like before any resolve has run, and it is exactly
+     * the case this path exists for. Genuine damage to the evidence blob is
+     * reported as its own limitation by the projection rather than being retried
+     * silently here.
+     */
+    private artifactRetryCanSucceed(latestRow: GitOpsArtifactSetRow): boolean {
+        let services: ServiceArtifactEvidence[] | undefined;
+        try {
+            const decoded = decodeArtifactEvidenceJson(latestRow.evidence_json);
+            services = 'services' in decoded ? decoded.services : undefined;
+        } catch {
+            // Unreadable evidence is a projection-level defect. Retrying cannot
+            // repair the blob, and the drift check reports it either way.
+            return false;
+        }
+        if (!services || services.length === 0) return true;
+        // Every service must have a clearable cause. One permanent failure is
+        // enough to hold the set back, because the resolve reduces to the
+        // weakest qualification across services.
+        return services.every((service) => {
+            // A resolved service (null failureClass) inside an otherwise
+            // unresolved set is the mixed case the freeze can still complete.
+            if (service.failureClass === null) return true;
+            return RETRYABLE_SERVICE_FAILURES.has(service.failureClass);
+        });
+    }
+
+    /**
+     * Re-resolve a freeze whose registry resolve could not complete.
+     *
+     * Answers whether a *new* expectation was produced, so the caller can hold
+     * this tick's comparison back and let the next one judge evidence nobody has
+     * seen yet.
+     *
+     * Gated on how recently the unresolved expectation was recorded, because the
+     * reconciler runs this whole check every 60 seconds and a registry that is
+     * down would otherwise be asked once per target per tick forever.
+     *
+     * The gate reads the *latest* evidence for the generation, not the expected
+     * set. The distinction is load-bearing: a failed resolve records a fresh
+     * `unavailable` row that does **not** advance the expected pointer
+     * (`allowedExpectedAdvance` refuses it), so dating the window from the
+     * expected set would pin it to the original freeze forever and the second
+     * tick onwards would retry every 60 seconds. The latest pointer advances on
+     * every recorded resolve, successful or not, so it moves with each attempt.
+     *
+     * Reading a row rather than keeping a timer means there is no schedule to
+     * manage and no state to reconcile across restarts: the next attempt happens
+     * once the current window has elapsed. The interval is the operator's to set.
+     *
+     * Failure is logged and dropped rather than raised, and answers false. A
+     * retry that cannot resolve leaves exactly the state it found, and the caller
+     * is about to report `unverified`, which is the honest answer for a target
+     * with no provable approved identity. Letting the rejection escape would fail
+     * the whole drift check, including the parts that had already answered.
+     */
+    private async retryArtifactFreeze(
+        blueprint: Blueprint,
+        node: Node,
+        applicationId: string,
+        binding: Extract<ReturnType<typeof resolveRuntimeRepairBinding>, { kind: 'binding' }>,
+        expectedRow: GitOpsArtifactSetRow | undefined,
+    ): Promise<boolean> {
+        if (!expectedRow) {
+            // No set to date the window from, so there is nothing to throttle
+            // against. A missing pointer is a different defect from a failed
+            // resolve, and re-resolving on every tick would paper over it.
+            return false;
+        }
+        // A generation whose retry was already refused is not asked again. See
+        // `refusedFreezeRetries` for why this cannot be a time-based gate.
+        if (this.refusedFreezeRetries.get(`${applicationId}:${node.id}`) === binding.acceptedGenerationId) {
+            return false;
+        }
+
+        // Everything below judges the *latest* recorded evidence, which is the one
+        // row a failed resolve can actually move. Reading the expected set here
+        // was the bug in this gate: a failed resolve writes a new row without
+        // advancing the expected pointer, so the expected set keeps describing the
+        // original freeze and a permanent failure looked clearable forever.
+        const store = GitOpsStore.getInstance();
+        const target = store.getTarget(applicationId, node.id);
+        const latestRow = (target?.latest_artifact_set_id
+            ? store.getArtifactSet(target.latest_artifact_set_id)
+            : undefined) ?? expectedRow;
+
+        if (!RETRYABLE_ARTIFACT_QUALIFICATIONS.has(latestRow.qualification)) return false;
+        if (!this.artifactRetryCanSucceed(latestRow)) return false;
+
+        // Falls back to the expected set's own age for a target that never
+        // recorded one, so a missing latest pointer throttles on the original
+        // freeze rather than retrying every tick.
+        const lastAttemptAt = latestRow.created_at;
+        const intervalMs = DatabaseService.getInstance().getGitOpsArtifactRetryIntervalMins() * 60_000;
+        // No clamp on the age, and deliberately: a stamp dated in the future (a
+        // clock step backwards, or a database restored from a host whose clock
+        // ran ahead) makes the age negative, which fails the same comparison and
+        // therefore waits out a full interval rather than retrying at once. That
+        // is the direction to be wrong in: a wrong-in-the-past stamp delays a
+        // retry by one interval, a wrong-in-the-future one would hammer a
+        // registry that is already struggling.
+        if (Date.now() - lastAttemptAt < intervalMs) return false;
+
+        // Skipped, not blocked, when a deploy holds this target's lock. A
+        // deploy resolves the freeze itself, so a concurrent retry would only
+        // contend for the same artifact rows.
+        if (!this.acquireLock(blueprint.id, node.id)) return false;
+        try {
+            // Whether the expectation actually moved is what separates "resolved,
+            // so hold this tick's comparison" from "tried, and there was nothing
+            // to resolve". The producer reports it from the target's pointer,
+            // because it is the pointer the next tick compares against and the one
+            // Enforce would pin to.
+            const outcome = await retryInlineArtifactFreeze({
+                blueprintId: blueprint.id,
+                nodeId: node.id,
+                generationId: binding.acceptedGenerationId,
+            });
+            if (outcome === 'refused') {
+                this.refusedFreezeRetries.set(
+                    `${applicationId}:${node.id}`,
+                    binding.acceptedGenerationId,
+                );
+            }
+            return outcome === 'resolved';
+        } catch (err) {
+            // Nothing was resolved, so the caller keeps the expectation it had.
+            // Answering false rather than falling through matters: this return is
+            // the only thing that stops a second attempt running outside the lock
+            // that the `finally` just released.
+            console.error(
+                '[BlueprintService] artifact freeze retry failed blueprint=%s node=%s error=%s',
+                sanitizeForLog(blueprint.name),
+                node.id,
+                sanitizeForLog(BlueprintService.formatError(err)),
+            );
+            return false;
+        } finally {
+            this.releaseLock(blueprint.id, node.id);
         }
     }
 

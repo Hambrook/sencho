@@ -8,7 +8,11 @@ import axios from 'axios';
 import { setupTestDb, cleanupTestDb } from './helpers/setupTestDb';
 import { GitOpsStore } from '../services/gitops/store';
 import { GitOpsTransitions, type EventEnvelope } from '../services/gitops/transitions';
-import { decodeObservedArtifactIdentity, encodeArtifactEvidenceJson } from '../services/gitops/json';
+import {
+  decodeArtifactEvidenceJson,
+  decodeObservedArtifactIdentity,
+  encodeArtifactEvidenceJson,
+} from '../services/gitops/json';
 import type { EffectiveArtifactContext } from '../services/gitops/effectiveArtifactContext';
 import type { GitOpsApplicationRow, GitOpsGenerationRow } from '../services/gitops/types';
 import { DEFAULT_PLACEMENT_POLICY, DEFAULT_ROLLOUT_AUTHORIZATION_POLICY } from '../services/gitops/policyComposition';
@@ -130,6 +134,35 @@ function mockLeafContext(data: EffectiveArtifactContext) {
   return vi.spyOn(axios, 'get').mockResolvedValue({ status: 200, data });
 }
 
+/**
+ * The leaf's platform alone, which is all the approved-intent path needs from it.
+ */
+function mockLeafPlatform(platform: { os: string; architecture: string }) {
+  return vi.spyOn(axios, 'get').mockResolvedValue({ status: 200, data: { platform } });
+}
+
+/**
+ * A leaf that cannot answer the platform route, which is what a hub running ahead
+ * of its leaves gets: the route does not exist there, so it answers 404.
+ */
+function mockLeafWithoutPlatformRoute() {
+  return vi.spyOn(axios, 'get').mockResolvedValue({
+    status: 404,
+    data: { error: 'Not found' },
+  });
+}
+
+/**
+ * A leaf whose platform read failed this time, which is what a timeout, a 5xx, or
+ * a briefly unreachable daemon looks like.
+ */
+function mockLeafPlatformReadFailing(status = 503) {
+  return vi.spyOn(axios, 'get').mockResolvedValue({
+    status,
+    data: { error: 'temporarily unavailable' },
+  });
+}
+
 function expectHubLocalSkipped(): void {
   expect(mockBuildEffectiveServiceModel).not.toHaveBeenCalled();
   expect(mockDockerInfo).not.toHaveBeenCalled();
@@ -164,6 +197,162 @@ function seedDirectApp(ids: {
 }
 
 describe('remote effective artifact context for digest freeze', () => {
+  it('reads only the leaf platform when resolving approved intent, never its compose', async () => {
+    // The approved-intent path exists so a later reconcile tick does not read
+    // the node's compose directory. That has to hold for a remote node too, so
+    // it asks the leaf for the platform alone, over the platform route, rather
+    // than for a rendered context. If it asked for the context instead, a hand
+    // edit on the leaf would become the approved identity on the hub.
+    const stackName = 'remote-intent-stack';
+    const applicationId = `app-remote-intent-${counter}`;
+    const generationId = `gen-remote-intent-${counter}`;
+    seedDirectApp({
+      applicationId,
+      generationId,
+      stackName,
+      artifactSetId: `art-remote-intent-${counter}`,
+    });
+
+    const axiosGetSpy = mockLeafPlatform({ ...LEAF_PLATFORM });
+    mockResolveRegistry.mockResolvedValue({
+      ok: true,
+      indexDigest: `sha256:${'2'.repeat(64)}`,
+      platformDigest: `sha256:${'b'.repeat(64)}`,
+      platformLabel: 'linux/arm64',
+      qualification: 'exact',
+    });
+
+    await resolveAndRecordArtifactSet({
+      stackName,
+      nodeId: remoteNodeId,
+      applicationId,
+      generationId,
+      buildContexts: [],
+      envelope: envelope(`op-remote-intent-${counter}`),
+      approvedServices: [{
+        name: 'web',
+        declaredImage: 'nginx:1.27',
+        hasBuild: false,
+        expectedReplicas: 1,
+        dependsOn: [],
+        hasHealthcheck: false,
+      }],
+    });
+
+    expect(axiosGetSpy).toHaveBeenCalledWith(
+      'http://192.168.1.50:1852/api/stacks/platform/docker-context',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: `Bearer ${'t'.repeat(64)}`,
+        }),
+      }),
+    );
+    expect(
+      axiosGetSpy.mock.calls.map((c) => String(c[0])),
+      'and never asks the leaf for a rendered compose model',
+    ).not.toContain(`http://192.168.1.50:1852/api/stacks/${stackName}/effective-artifact-context`);
+    expectHubLocalSkipped();
+
+    const latestId = GitOpsStore.getInstance().getApplication(applicationId)?.latest_artifact_set_id;
+    const latest = latestId ? GitOpsStore.getInstance().getArtifactSet(latestId) : undefined;
+    expect(latest?.qualification, 'the arm64 child the leaf runs is what was pinned').toBe('exact');
+    const decoded = latest ? decodeArtifactEvidenceJson(latest.evidence_json) : null;
+    const recorded = decoded && 'services' in decoded ? decoded.services ?? [] : [];
+    expect(recorded[0]?.platformDigest).toBe(`sha256:${'b'.repeat(64)}`);
+  });
+
+  it('records a moving tag as unavailable when the leaf cannot report its platform', async () => {
+    // A hub running ahead of its leaves: the platform route does not exist there,
+    // so an approved-intent resolve can still parse the intent but cannot learn
+    // which manifest child the leaf runs. Resolving anyway would be a guess, so a
+    // moving tag must land as platform_ambiguity, which the retry gate then reads
+    // as permanent. The first attempt costs one honest row, not one per interval.
+    const stackName = 'remote-old-leaf-stack';
+    const applicationId = `app-remote-old-${counter}`;
+    const generationId = `gen-remote-old-${counter}`;
+    seedDirectApp({
+      applicationId,
+      generationId,
+      stackName,
+      artifactSetId: `art-remote-old-${counter}`,
+    });
+
+    mockLeafWithoutPlatformRoute();
+
+    await resolveAndRecordArtifactSet({
+      stackName,
+      nodeId: remoteNodeId,
+      applicationId,
+      generationId,
+      buildContexts: [],
+      envelope: envelope(`op-remote-old-${counter}`),
+      approvedServices: [{
+        name: 'web',
+        declaredImage: 'nginx:1.27',
+        hasBuild: false,
+        expectedReplicas: 1,
+        dependsOn: [],
+        hasHealthcheck: false,
+      }],
+    });
+
+    expect(
+      mockResolveRegistry,
+      'an unknown platform cannot pick a child, so the registry is not even asked',
+    ).not.toHaveBeenCalled();
+    const latestId = GitOpsStore.getInstance().getApplication(applicationId)?.latest_artifact_set_id;
+    const latest = latestId ? GitOpsStore.getInstance().getArtifactSet(latestId) : undefined;
+    expect(latest?.qualification, 'never a false exact from a guessed platform').toBe('unavailable');
+    const decoded = latest ? decodeArtifactEvidenceJson(latest.evidence_json) : null;
+    const recorded = decoded && 'services' in decoded ? decoded.services ?? [] : [];
+    expect(recorded[0]?.failureClass, 'and permanent, so the retry gate can stop').toBe('platform_ambiguity');
+  });
+
+  it('records a transient platform-read failure as retryable, not as a permanent stop', async () => {
+    // The distinction S9 collapsed. A leaf that answers 5xx or times out could
+    // answer on the next tick, and treating that like an older leaf switched the
+    // retry off for every remote target until an unrelated redeploy. The two must
+    // produce different failure classes, because the retry gate reads the class.
+    const stackName = 'remote-flaky-leaf-stack';
+    const applicationId = `app-remote-flaky-${counter}`;
+    const generationId = `gen-remote-flaky-${counter}`;
+    seedDirectApp({
+      applicationId,
+      generationId,
+      stackName,
+      artifactSetId: `art-remote-flaky-${counter}`,
+    });
+
+    mockLeafPlatformReadFailing(503);
+
+    await resolveAndRecordArtifactSet({
+      stackName,
+      nodeId: remoteNodeId,
+      applicationId,
+      generationId,
+      buildContexts: [],
+      envelope: envelope(`op-remote-flaky-${counter}`),
+      approvedServices: [{
+        name: 'web',
+        declaredImage: 'nginx:1.27',
+        hasBuild: false,
+        expectedReplicas: 1,
+        dependsOn: [],
+        hasHealthcheck: false,
+      }],
+    });
+
+    const latestId = GitOpsStore.getInstance().getApplication(applicationId)?.latest_artifact_set_id;
+    const latest = latestId ? GitOpsStore.getInstance().getArtifactSet(latestId) : undefined;
+    expect(latest?.qualification).toBe('unavailable');
+    const decoded = latest ? decodeArtifactEvidenceJson(latest.evidence_json) : null;
+    const recorded = decoded && 'services' in decoded ? decoded.services ?? [] : [];
+    expect(
+      recorded[0]?.failureClass,
+      'a leaf that could not answer is worth asking again',
+    ).toBe('platform_unavailable');
+  });
+
   it('freezes from the leaf HTTP context and never reads hub-local model or Docker', async () => {
     const stackName = 'remote-only-stack';
     const applicationId = `app-remote-${counter}`;

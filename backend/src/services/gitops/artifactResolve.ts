@@ -36,6 +36,7 @@ import { sanitizeForLog } from '../../utils/safeLog';
 import {
   loadEffectiveArtifactContext,
   platformLabelOf,
+  readNodePlatform,
   type EffectiveArtifactContext,
   type NodePlatform,
 } from './effectiveArtifactContext';
@@ -105,9 +106,12 @@ function mapRegistryFailure(reason: string): ArtifactServiceFailureClass {
 async function resolveRegistryService(
   serviceName: string,
   authoredRef: string,
-  platform: { os: string; architecture: string } | null,
+  platformRead: NodePlatformRead,
   resolvedAt: number,
 ): Promise<ServiceResolveResult> {
+  // A platform that could not be read is labelled as absent rather than guessed,
+  // and which failure class it produces is decided below.
+  const platform = platformRead.status === 'ok' ? platformRead.platform : null;
   const referenceKind = classifyReferenceKind(authoredRef);
   if (referenceKind === 'digest_pinned') {
     const match = authoredRef.match(DIGEST_PIN_RE);
@@ -135,7 +139,9 @@ async function resolveRegistryService(
         serviceName,
         authoredRef,
         source: 'registry',
-        platform: platform ? `${platform.os}/${platform.architecture}` : null,
+        platform: platformRead.status === 'ok' && platformRead.platform
+          ? `${platformRead.platform.os}/${platformRead.platform.architecture}`
+          : null,
         indexDigest: digest,
         platformDigest: digest,
         buildContextFingerprint: null,
@@ -165,6 +171,12 @@ async function resolveRegistryService(
     };
   }
   if (!platform) {
+    // Two different situations, and they must not share a class. `route_missing`
+    // is a leaf older than this hub: the route does not exist there and will not
+    // appear on its own, so the answer is permanent and the retry stops.
+    // Anything else is a daemon that could not answer this time, which is the
+    // transient case the retry exists for, and calling it permanent switched the
+    // retry off for every remote target until the next redeploy.
     return {
       qualification: 'unavailable',
       evidence: {
@@ -176,7 +188,9 @@ async function resolveRegistryService(
         platformDigest: null,
         buildContextFingerprint: null,
         producedImageId: null,
-        failureClass: 'platform_ambiguity',
+        failureClass: platformRead.status === 'route_missing'
+          ? 'platform_ambiguity'
+          : 'platform_unavailable',
         resolvedAt,
       },
     };
@@ -229,7 +243,7 @@ async function resolveRegistryService(
 
 async function resolveOneService(
   spec: EffectiveServiceSpec,
-  platform: { os: string; architecture: string } | null,
+  platformRead: NodePlatformRead,
   buildContexts: readonly BuildContextPlan[],
   resolvedAt: number,
 ): Promise<ServiceResolveResult> {
@@ -240,7 +254,9 @@ async function resolveOneService(
         serviceName: spec.name,
         authoredRef: spec.declaredImage,
         source: 'build',
-        platform: platform ? `${platform.os}/${platform.architecture}` : null,
+        platform: platformRead.status === 'ok' && platformRead.platform
+          ? `${platformRead.platform.os}/${platformRead.platform.architecture}`
+          : null,
         indexDigest: null,
         platformDigest: null,
         buildContextFingerprint: buildContextFingerprint(spec.name, buildContexts),
@@ -268,7 +284,7 @@ async function resolveOneService(
     };
   }
   try {
-    return await resolveRegistryService(spec.name, spec.declaredImage, platform, resolvedAt);
+    return await resolveRegistryService(spec.name, spec.declaredImage, platformRead, resolvedAt);
   } catch (error) {
     console.error(
       `[GitOpsArtifactResolve] Registry resolve failed for ${spec.name}:`,
@@ -280,7 +296,9 @@ async function resolveOneService(
         serviceName: spec.name,
         authoredRef: spec.declaredImage,
         source: 'registry',
-        platform: platform ? `${platform.os}/${platform.architecture}` : null,
+        platform: platformRead.status === 'ok' && platformRead.platform
+          ? `${platformRead.platform.os}/${platformRead.platform.architecture}`
+          : null,
         indexDigest: null,
         platformDigest: null,
         buildContextFingerprint: null,
@@ -471,7 +489,16 @@ async function resolveServices(
   nodeId: number,
   buildContexts: readonly BuildContextPlan[],
   resolvedAt: number,
+  approvedServices?: readonly EffectiveServiceSpec[],
 ): Promise<{ services: ServiceArtifactEvidence[]; qualification: ArtifactQualification; evidence: ArtifactEvidenceJson }> {
+  // The platform always comes from the node, including on the approved-intent
+  // path: which manifest child is correct is a property of the machine, not of
+  // the intent. Only the service specs come from the intent.
+  const platform = await readPlatformForNode(nodeId);
+  if (approvedServices) {
+    return resolveAgainstSpecs(approvedServices, platform, buildContexts, resolvedAt);
+  }
+
   const context = await loadArtifactContextForNode(nodeId, stackName);
   if (context && !context.renderable) {
     console.warn(
@@ -489,16 +516,111 @@ async function resolveServices(
     };
   }
 
-  const platform = context.platform;
-  const resolved = await Promise.all(
-    context.services.map((spec) => resolveOneService(spec, platform, buildContexts, resolvedAt)),
+  // The rendered path already read the platform as part of loading the context,
+  // so a 404 on the platform route cannot arise here: the older-leaf case only
+  // exists on the path that asks for the platform by itself.
+  return resolveAgainstSpecs(
+    context.services,
+    { status: 'ok', platform: context.platform },
+    buildContexts,
+    resolvedAt,
   );
-  const serviceQuals = resolved.map((entry) => entry.qualification);
-  const services = resolved.map((entry) => entry.evidence);
+}
 
-  const qualification = weakestQualification(serviceQuals);
-  const evidence = buildArtifactEvidence(qualification, services);
-  return { services, qualification, evidence };
+/** Resolve each spec against the node's platform and reduce to one qualification. */
+async function resolveAgainstSpecs(
+  specs: readonly EffectiveServiceSpec[],
+  platform: NodePlatformRead,
+  buildContexts: readonly BuildContextPlan[],
+  resolvedAt: number,
+): Promise<{ services: ServiceArtifactEvidence[]; qualification: ArtifactQualification; evidence: ArtifactEvidenceJson }> {
+  const entries = await Promise.all(
+    specs.map((spec) => resolveOneService(spec, platform, buildContexts, resolvedAt)),
+  );
+  const services = entries.map((entry) => entry.evidence);
+  const qualification = weakestQualification(entries.map((entry) => entry.qualification));
+  return { services, qualification, evidence: buildArtifactEvidence(qualification, services) };
+}
+
+/**
+ * How the node's platform read went.
+ *
+ * The distinction exists because the two failure modes deserve opposite
+ * treatment. A leaf that cannot answer the platform route is a leaf older than
+ * this hub, and it will not start answering on its own, so retrying it forever is
+ * pure cost. A daemon that is unreachable, a timeout, or a 5xx is exactly the
+ * transient case the retry exists for, and treating those the same silently
+ * switched the retry off for every remote target until the next redeploy.
+ */
+type NodePlatformRead =
+  | { status: 'ok'; platform: NodePlatform | null }
+  | { status: 'route_missing' };
+
+async function readPlatformForNode(nodeId: number): Promise<NodePlatformRead> {
+  const node = DatabaseService.getInstance().getNode(nodeId);
+  if (!node) return { status: 'ok', platform: null };
+  if (node.type === 'remote') {
+    return fetchRemotePlatform(nodeId);
+  }
+  // A local daemon that cannot answer is transient by definition: the same call
+  // works once it is back.
+  return { status: 'ok', platform: await readNodePlatform(nodeId) };
+}
+
+/**
+ * A remote node's Docker platform, read from the leaf's own daemon.
+ *
+ * Its own route rather than the effective-artifact-context one, because that one
+ * also renders the stack. The leaf answers from `docker info` alone and never
+ * reads a compose file, which is the property that makes it safe to call from a
+ * path that is deliberately not reading the node's compose directory.
+ *
+ * A 404 is reported as `route_missing` and everything else as a readable-but-null
+ * platform, which is what separates "this leaf is too old to be asked" from "this
+ * leaf could not answer right now".
+ */
+async function fetchRemotePlatform(nodeId: number): Promise<NodePlatformRead> {
+  const target = NodeRegistry.getInstance().getProxyTarget(nodeId);
+  if (!target) {
+    console.warn(
+      '[GitOpsArtifactResolve] No proxy target for remote platform read on node %s',
+      nodeId,
+    );
+    return { status: 'ok', platform: null };
+  }
+  const proxy = LicenseService.getInstance().getProxyHeaders();
+  const url = `${target.apiUrl.replace(/\/$/, '')}/api/stacks/platform/docker-context`;
+  try {
+    const res = await axios.get(url, {
+      ...safeAxiosTransport(target.trustedLoopback),
+      headers: {
+        Authorization: `Bearer ${target.apiToken}`,
+        [PROXY_TIER_HEADER]: proxy.tier,
+        'Content-Type': 'application/json',
+      },
+      timeout: REMOTE_RESOLVE_TIMEOUT_MS,
+      validateStatus: () => true,
+    });
+    if (res.status === 404) {
+      return { status: 'route_missing' };
+    }
+    if (res.status !== 200) {
+      console.warn(
+        '[GitOpsArtifactResolve] Remote platform read returned %s for node %s',
+        res.status,
+        nodeId,
+      );
+      return { status: 'ok', platform: null };
+    }
+    return { status: 'ok', platform: isNodePlatform(res.data?.platform) ? res.data.platform : null };
+  } catch (err) {
+    console.warn(
+      '[GitOpsArtifactResolve] Remote platform read failed for node %s: %s',
+      nodeId,
+      sanitizeForLog(err instanceof Error ? err.message : String(err)),
+    );
+    return { status: 'ok', platform: null };
+  }
 }
 
 function buildArtifactEvidence(
@@ -549,6 +671,21 @@ function recordResolvedEvidence(args: {
   });
 }
 
+/**
+ * Resolve the artifact set for a generation and record it.
+ *
+ * `approvedServices` pins what is being resolved. Supplying it makes this a
+ * resolve of *approved intent* rather than of whatever is on the node's disk,
+ * which is the only form a caller may use outside the deploy that just wrote
+ * the compose: the node's directory is observable state that a later tick, a
+ * hand edit, or a restored backup can put out of step with what was approved,
+ * and recording that as the approved identity would let a local change become
+ * fleet intent. Callers that omit it are resolving immediately after their own
+ * deploy, where disk and intent are the same bytes by construction.
+ *
+ * Omitted, the node's rendered model supplies the specs, which is what the
+ * deploy-time freeze and the Direct apply paths want.
+ */
 export async function resolveAndRecordArtifactSet(args: {
   stackName: string;
   nodeId: number;
@@ -556,6 +693,11 @@ export async function resolveAndRecordArtifactSet(args: {
   generationId: string;
   buildContexts: readonly BuildContextPlan[];
   envelope: EventEnvelope;
+  /**
+   * Service specs from the approved intent, resolved against this node's
+   * platform. Omit only on a path that wrote the compose itself.
+   */
+  approvedServices?: readonly EffectiveServiceSpec[];
 }): Promise<void> {
   try {
     const resolvedAt = args.envelope.at;
@@ -564,6 +706,7 @@ export async function resolveAndRecordArtifactSet(args: {
       args.nodeId,
       args.buildContexts,
       resolvedAt,
+      args.approvedServices,
     );
     recordResolvedEvidence({
       applicationId: args.applicationId,
@@ -573,6 +716,11 @@ export async function resolveAndRecordArtifactSet(args: {
       envelope: args.envelope,
     });
   } catch (error) {
+    // A failed resolve is recorded as its own evidence rather than raised: the
+    // caller has already applied or written something, and losing the evidence
+    // row must not turn that into a reported failure. The `unavailable` row this
+    // writes is what the retry gate reads, so it is also what starts the clock
+    // for the next attempt.
     console.error(
       `[GitOpsArtifactResolve] Resolution failed for ${args.applicationId}/${args.generationId}:`,
       error instanceof Error ? error.message : String(error),

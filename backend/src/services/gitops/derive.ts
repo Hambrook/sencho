@@ -1159,7 +1159,12 @@ function deriveArtifact(
   if (app.target_mode === 'inline_blueprint' && !generationId) return { status: 'not_applicable' };
   if (!generationId) return { status: 'not_applicable' };
   const store = GitOpsStore.getInstance();
-  const expected = expectedId ? toExpected(store, expectedId, limitations) : null;
+  // Read before `toExpected` because the expected set's limitation is decided by
+  // the latest evidence, and this is the only place that has both.
+  const latestRow = latestId ? store.getArtifactSet(latestId) : undefined;
+  const expected = expectedId
+    ? toExpected(store, expectedId, latestRow?.qualification ?? null, limitations)
+    : null;
   if (!latestId) {
     return {
       status: 'artifact_unresolved',
@@ -1169,7 +1174,6 @@ function deriveArtifact(
       limitation: 'artifact_pointer_missing',
     };
   }
-  const latestRow = store.getArtifactSet(latestId);
   if (!latestRow) {
     limitations.push({ code: 'artifact_pointer_missing', message: 'latest artifact row is missing', evidence: latestId });
     return {
@@ -1242,15 +1246,62 @@ function artifactStatus(
   return qualification === 'qualified' ? 'artifact_qualified' : 'artifact_exact';
 }
 
+/**
+ * The artifact set a target or application expects, with its qualification.
+ *
+ * `latestQualification` is the qualification of the row recorded last, and it is
+ * what decides the limitation below. Deliberate: the facet status one call away
+ * is derived from the same value, so the caveat and the status cannot disagree
+ * about the same target, and neither outlives the condition it describes.
+ */
 function toExpected(
   store: GitOpsStore,
   id: string,
+  latestQualification: ArtifactQualification | null,
   limitations: GitOpsLimitation[],
 ): ArtifactExpectedIdentity | null {
   const row = store.getArtifactSet(id);
   if (!row) {
     limitations.push({ code: 'artifact_pointer_missing', message: 'expected artifact row is missing', evidence: id });
     return null;
+  }
+  // Fires when the *expectation* is not comparable, because that is the claim the
+  // copy makes: drift between what is running and what was intended is not being
+  // checked.
+  //
+  // The latest evidence is consulted for one thing only: a stack that builds on
+  // the node keeps an `unresolved` expected row for the generation's whole life,
+  // while every recorded row says `local_build_unverified`. That is a permanent
+  // property of the stack rather than an unresolved state a resolve can clear, so
+  // a caveat there would be true forever and would duplicate a facet status that
+  // already explains it more precisely.
+  //
+  // It is deliberately *not* the sole condition. Reading only the latest row fired
+  // this caveat whenever newer evidence disagreed with an expectation that was
+  // itself comparable, which claims drift is unchecked at a moment it is being
+  // checked. The expectation decides whether the claim is true; the latest row
+  // only decides whether it is worth repeating.
+  //
+  // A `stale` expectation is not specially excluded, and does not need to be:
+  // `allowedExpectedAdvance` refuses stale the same way it refuses everything but
+  // exact/qualified, so the expected pointer never holds a stale row. Staleness
+  // is recorded on the latest row, which is why it reaches the operator through
+  // the facet status rather than through this caveat.
+  //
+  // Deliberately not scoped to the target mode, and the copy therefore does not
+  // promise a retry. The drift check re-resolves an expectation only for an
+  // Inline Blueprint (`retryInlineArtifactFreeze`); a Git-managed one recovers
+  // through its own preflight and authorization path, and a Direct one through
+  // the next apply. What the caveat reports, that what is running is not being
+  // compared against what was intended, is true of all of them.
+  const expectationIsComparable = row.qualification === 'exact' || row.qualification === 'qualified';
+  const isPermanentLocalBuild = latestQualification === 'local_build_unverified';
+  if (!expectationIsComparable && !isPermanentLocalBuild) {
+    limitations.push({
+      code: 'artifact_expectation_unresolved',
+      message: 'the expected artifact set has no provable executable identity',
+      evidence: row.id,
+    });
   }
   try {
     const decoded = decodeArtifactEvidenceJson(row.evidence_json);
