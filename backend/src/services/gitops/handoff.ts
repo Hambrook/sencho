@@ -26,6 +26,7 @@ import {
 } from './registryReadiness';
 import { stackManagedRoot } from './directApplication';
 import { decodeGitOpsRequiredTargetsJson } from './json';
+import { configuredSnapshotFor, encodePolicySnapshot } from './policyComposition';
 import { recoveryBindingForTarget } from './recoveryCapture';
 import {
   DEFAULT_HEALTH_ROLLOUT_POLICY,
@@ -447,6 +448,16 @@ export async function ensureRolloutAuthorization(
     // this rollout can be captured. A policy the operator changes afterwards
     // applies at the next authorization, never to a rollout already running.
     const strategyJson = frozenStrategyFor(store, app, ingredients.intentRevisionId);
+    // The policy this mint is recorded under, read here rather than from the row
+    // this function opened with. Reading after the preflight await is what
+    // matters: that await is long enough for a policy edit to land, so a snapshot
+    // taken from the row read before it would already be stale by the time the
+    // write transaction compares it. What is left is the synchronous gap to the
+    // write, and an operator mint records no snapshot because no policy decided
+    // it.
+    const policyProvenanceJson = authority === 'configured_policy'
+      ? encodePolicySnapshot(configuredSnapshotFor(store.getApplication(applicationId) ?? app))
+      : null;
     try {
       transitions.rolloutAuthorized({
         applicationId: app.id,
@@ -458,6 +469,7 @@ export async function ensureRolloutAuthorization(
         actor,
         envelope: envelopeFor(actor, trigger),
         authority,
+        policyProvenanceJson,
       });
     } catch (err) {
       const message = errorMessage(err);
@@ -472,6 +484,16 @@ export async function ensureRolloutAuthorization(
             applicationId: app.id,
             envelope: envelopeFor(actor, `${trigger}:preflight_race`),
           });
+          // Read again rather than reused from above: the failed attempt and the
+          // invalidation both happened after that read, and the retry is a
+          // separate mint that has to carry the snapshot for itself. Reading
+          // here also keeps the window the agreement check guards down to the
+          // write. The racing writer's row is preferred because it is the
+          // freshest, and the caller's row is the fallback for an application
+          // that could not be read at all.
+          const racedPolicyProvenanceJson = authority === 'configured_policy'
+            ? encodePolicySnapshot(configuredSnapshotFor(raced ?? app))
+            : null;
           try {
             transitions.rolloutAuthorized({
               applicationId: app.id,
@@ -483,6 +505,7 @@ export async function ensureRolloutAuthorization(
               actor,
               envelope: envelopeFor(actor, `${trigger}:preflight_race`),
               authority,
+              policyProvenanceJson: racedPolicyProvenanceJson,
             });
           } catch (retryErr) {
             return { ok: false, reason: `Rollout authorization failed: ${errorMessage(retryErr)}` };
