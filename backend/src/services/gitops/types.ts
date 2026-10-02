@@ -969,6 +969,25 @@ export type GitOpsTargetProjection = {
   health: HealthFacet;
   healthGate: HealthGateFacet;
   lkg: LkgFacet;
+  /**
+   * Whether work already under way is producing the verdict that will replace a
+   * recorded health failure: a live operation on the generation the failure was
+   * recorded against, or a stack-scope health run for that generation that is
+   * still observing. The second arm reads the health-run table, not the target
+   * row, because the run is what the gate holds open.
+   *
+   * Only meaningful while `health.status` is `failed`. It is a fact about the
+   * row columns and the recorded generation, not a tone: the consumer still
+   * decides what to present.
+   *
+   * **Absent means not superseded.** A remote instance on an older build answers
+   * without the field, and the value arrives as `undefined` even though this type
+   * requires a boolean, so a falsy read is what reports the failure there. The
+   * protection against a peer suppressing a failure with a malformed truthy value
+   * is not in how this is read but in `isTargetRecord`, which accepts only an
+   * absent field or a boolean at the remote boundary.
+   */
+  healthFailureSuperseded: boolean;
   tombstoned: boolean;
 };
 
