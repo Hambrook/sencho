@@ -2905,6 +2905,18 @@ export class GitOpsTransitions {
         // derived from later evidence.
         target.desired_generation_id = app.accepted_generation_id;
         target.applied_generation_id = app.accepted_generation_id;
+        // The recorded identity described the previous artifact set, which is
+        // no longer the one this target is expected to satisfy. Keeping it would
+        // make the projection compare a stale identity against the new expected
+        // set and report confirmed artifact drift for a stack that has simply
+        // not been re-checked yet, so the observation is dropped and the target
+        // reads as awaiting verification until the reconciler looks again.
+        // Dropped rather than kept: an identity recorded against an expectation
+        // that no longer exists is not evidence about the current one.
+        if (target.expected_artifact_set_id !== null
+          && target.expected_artifact_set_id !== app.artifact_set_id) {
+          target.observed_artifact_identity_json = null;
+        }
         target.expected_artifact_set_id = app.artifact_set_id;
         target.latest_artifact_set_id = app.artifact_set_id;
         target.source_acceptance_ref = app.source_acceptance_ref;
@@ -3168,15 +3180,45 @@ export class GitOpsTransitions {
       args.stage,
       null,
       (target) => {
+        const before = { latestStage: target.latest_stage, targetStatus: target.target_status };
         if (target.target_status !== 'active') {
-          throw new GitOpsTransitionError('cannot observe a tombstoned target');
+          // One observation re-opens a severed placement, and only one. A
+          // state-review hold is a decision that this node needs confirming
+          // before it may be placed, which is an explicit request for the node
+          // rather than a report about it, so a node the model had severed and
+          // that is still wanted comes back the way an explicit deploy brings it
+          // back. Every other stage is a report about what was seen, and
+          // reviving a retired target to record one would resurrect a placement
+          // nothing has asked for.
+          //
+          // This heals the projection whenever a hold is recorded against a
+          // severed node; it does not by itself restore automatic placement. The
+          // reconciler's decision pass skips severed nodes, so a node that was
+          // cleared has to be asked for again explicitly, which is the same
+          // deliberate act that brings a severed target back for a deploy.
+          //
+          // The two cannot chase each other on their own: a stale guard is
+          // cleared only for a node that is no longer desired, and this is
+          // recorded only for a node that is, so a clear cannot re-hold while
+          // the node stays undesired. A re-hold needs the node to become desired
+          // again, by an operator edit or a selector change, and that is a new
+          // placement decision rather than an oscillation.
+          if (args.stage !== 'blueprint_state_review') {
+            throw new GitOpsTransitionError('cannot observe a tombstoned target');
+          }
+          target.target_status = 'active';
+          // The severance abandoned whatever this target had in flight, and an
+          // interruption outranks the observation below, so a surviving one
+          // would report the abandoned operation instead of the hold that
+          // re-opened the placement. Cleared for the same reason tombstoning
+          // clears the active operation: nothing is going to finish it.
+          this.clearTargetInterruption(target, target.interruption_stage);
         }
         // The runtime facet projects these stages, which is the only route
         // an observation has into the derived status: the reconciler records
         // what it saw rather than moving any pointer. The history row written
         // alongside is the separate, unprojected record. `mutateTarget` stamps
         // the stage.
-        const before = { latestStage: target.latest_stage };
         return { before, after: { observed: args.stage } };
       },
     );
