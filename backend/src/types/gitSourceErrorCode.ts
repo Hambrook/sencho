@@ -24,6 +24,7 @@ export const GIT_SOURCE_ERROR_CODE_VALUES = [
     'PLAN_UNAVAILABLE',
     'OPERATION_IN_FLIGHT',
     'SOURCE_CLAIMED_BY_BLUEPRINT',
+    'SOPS_DECRYPT_FAILED',
 ] as const;
 
 export type GitSourceErrorCode = (typeof GIT_SOURCE_ERROR_CODE_VALUES)[number];

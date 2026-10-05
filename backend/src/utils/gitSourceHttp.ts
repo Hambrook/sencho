@@ -13,6 +13,7 @@
  */
 import type { Response } from 'express';
 import { GitSourceError } from '../services/GitSourceService';
+import { SopsDecryptError } from '../services/gitops/sops/decode';
 import { GIT_SOURCE_ERROR_CODE_VALUES, type GitSourceErrorCode } from '../types/gitSourceErrorCode';
 
 export function gitSourceStatus(code: GitSourceErrorCode): number {
@@ -27,6 +28,7 @@ export function gitSourceStatus(code: GitSourceErrorCode): number {
       return 404;
     case 'UNSUPPORTED_REF':
     case 'SSH_HOST_KEY_FAILED':
+    case 'SOPS_DECRYPT_FAILED':
       return 400;
     case 'STALE_PLAN':
     case 'PLAN_BLOCKED':
@@ -96,6 +98,12 @@ export function sendGitSourceError(res: Response, err: unknown): void {
     if (err.extras?.plan) body.plan = err.extras.plan;
     if (err.extras?.planFingerprint) body.planFingerprint = err.extras.planFingerprint;
     res.status(gitSourceStatus(err.code)).json(body);
+    return;
+  }
+  // Paths that decrypt outside pullLocked (apply, deploy, recovery) surface the
+  // decrypt failure directly instead of falling through to a generic 500.
+  if (err instanceof SopsDecryptError) {
+    res.status(400).json({ error: err.message, code: 'SOPS_DECRYPT_FAILED' });
     return;
   }
   console.error('[GitSource] Unexpected error:', err);

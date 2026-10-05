@@ -2,6 +2,7 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { parse as parseYaml } from 'yaml';
 import WebSocket from 'ws';
 import DockerController from './DockerController';
 import { DatabaseService } from './DatabaseService';
@@ -317,6 +318,7 @@ export class ComposeService {
       args.push('-f', overridePath);
     }
     args.push(...action);
+    this.pinProjectNameForOverride(stackName, args, stackDirOverride);
     return args;
   }
 
@@ -1524,6 +1526,86 @@ export class ComposeService {
     return stackDir;
   }
 
+  /**
+   * Pin `-p <stack>` when Compose runs from an override directory.
+   *
+   * The project name normally comes from the working-directory basename, so a
+   * single-file stack carries no `-p` in its live or captured prefix. A SOPS
+   * decrypt overlay changes that basename to the operation id; without the pin
+   * Compose creates a stray project and leaves the real stack untouched.
+   */
+  private pinProjectNameForOverride(
+    stackName: string,
+    args: string[],
+    stackDirOverride?: string,
+  ): void {
+    if (!stackDirOverride) return;
+    if (path.resolve(stackDirOverride) === this.resolveValidatedStackDir(stackName)) return;
+    if (this.hasProjectNameFlag(args)) return;
+    if (this.composeDeclaresProjectName(args, path.resolve(stackDirOverride))) return;
+    const composeIdx = args.indexOf('compose');
+    args.splice(composeIdx >= 0 ? composeIdx + 1 : 0, 0, '-p', stackName);
+  }
+
+  /**
+   * A compose file with a top-level `name:` already fixes the project name, so
+   * an overlay's working-directory basename cannot leak into it. The pin must
+   * not override the authored name, or a SOPS deploy would start a second
+   * project beside the one the stack already runs.
+   */
+  private composeDeclaresProjectName(args: string[], stackDir: string): boolean {
+    const resolvedStackDir = path.resolve(stackDir);
+    const files: string[] = [];
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === '-f' || args[i] === '--file') files.push(args[i + 1]);
+    }
+    if (files.length === 0) {
+      files.push(
+        'compose.yaml', 'compose.yml',
+        'compose.override.yaml', 'compose.override.yml',
+        'docker-compose.yaml', 'docker-compose.yml',
+        'docker-compose.override.yaml', 'docker-compose.override.yml',
+      );
+    }
+    for (const file of files) {
+      const abs = path.resolve(resolvedStackDir, file);
+      // Canonical inline js/path-injection barrier at the read sink: only the
+      // stack tree is read. Generated overlay layers (digest pin, mesh,
+      // recovery) live outside it and cannot declare a project name.
+      if (!abs.startsWith(resolvedStackDir + path.sep)) continue;
+      try {
+        const content = fs.readFileSync(abs, 'utf8');
+        // A compose layer is small; anything larger is not one, and the read is
+        // synchronous on the deploy path.
+        if (content.length > 1_048_576) continue;
+        const doc: unknown = parseYaml(content);
+        if (doc !== null && typeof doc === 'object' && !Array.isArray(doc)) {
+          const name = (doc as Record<string, unknown>).name;
+          if (typeof name === 'string' && name.trim() !== '') return true;
+        }
+      } catch {
+        // A missing, unreadable, or non-YAML layer cannot declare a name.
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Positional scan: a compose file or env file literally named `-p` is a flag
+   * value, not a project-name flag, so skip each flag's value token.
+   */
+  private hasProjectNameFlag(args: string[]): boolean {
+    for (let i = 0; i < args.length; i++) {
+      const token = args[i];
+      if (token === '-f' || token === '--file' || token === '--env-file' || token === '--project-directory') {
+        i++;
+        continue;
+      }
+      if (token === '-p' || token === '--project-name') return true;
+    }
+    return false;
+  }
+
   /** Rebase a captured absolute stack path onto the overlay root when present. */
   private remapCapturedAbsToRoot(abs: string, stackDir: string, pathRoot: string): string | null {
     const remapped = path.resolve(pathRoot, path.relative(stackDir, abs));
@@ -1601,6 +1683,7 @@ export class ComposeService {
       }
       throw new Error(`Unsupported captured compose flag "${token}" for stack "${stackName}"`);
     }
+    this.pinProjectNameForOverride(stackName, out, overlayDir);
     return out;
   }
 
