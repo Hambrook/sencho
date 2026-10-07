@@ -34,7 +34,9 @@ A single rail summarises the state of every registered node so you can read the 
 
 ### Tabs
 
-The Fleet view is a tab strip. Every tier sees Overview, Readiness, Map, Docker Labels, Blueprints, Federation, and Actions. Snapshots appears for admins. Secrets appears for admins. Routing is a limited-availability fleet surface and is not part of the default tab strip. A vertical separator after **Docker Labels** (or after **Map** when Docker Labels is not present) divides the per-node monitoring tabs from the fleet-wide orchestration tabs.
+The Fleet view is a tab strip. Every tier sees Overview, Readiness, Map, Docker Labels, Blueprints, Federation, and Actions. Snapshots appears for admins. Secrets appears for admins. Routing is a limited-availability fleet surface and is not part of the default tab strip.
+
+The strip is a single row: the monitoring tabs (Overview, Readiness, Map, Docker Labels), a vertical separator, then the tabs that change the fleet or hold its fleet-wide controls (Snapshots, Blueprints, Federation, Actions, Secrets). The row scrolls sideways when a narrow window cannot fit it, and keeps the tab you are on in view. An alternative is one setting away, under **Settings → Appearance → Fleet → Fleet tab layout** (saved to your account): **Compact** keeps Overview, Readiness, Map, Blueprints and Actions on the strip and puts the rest under **More**, which shows the name of the tab you are on when it lives there. Every tab opens with one click in the default layout; in Compact the tabs under **More** take two.
 
 | Tab | Tier | What it does |
 |-----|------|--------------|
