@@ -302,10 +302,11 @@ describe('MobileStackDetail mobile editing', () => {
         expect(setActiveTab).toHaveBeenCalledWith('compose');
     });
 
-    it('normalizes an env tab to compose when the stack has no env file', () => {
+    it('allows editing env tab when the stack has no env file', () => {
         const setActiveTab = vi.fn();
         render(<MobileStackDetail {...makeProps({ editingCompose: true, activeTab: 'env', envExists: false, setActiveTab })} />);
-        expect(setActiveTab).toHaveBeenCalledWith('compose');
+        // Should not redirect to compose
+        expect(setActiveTab).not.toHaveBeenCalled();
     });
 
     it('blocks textarea edits while an env-file load is in flight', () => {

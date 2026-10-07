@@ -1289,6 +1289,11 @@ export function useStackActions(options: UseStackActionsOptions) {
       } else {
         editorState.setOriginalEnvContent(editorState.envContent);
         if (newEtag) editorState.setEnvEtag(newEtag);
+        // If we just created a new env file, mark it as existing
+        editorState.setEnvExists(true);
+        const sel = editorState.selectedEnvFile || '.env';
+        editorState.setSelectedEnvFile(sel);
+        editorState.setEnvFiles([sel]);
       }
       toast.success('File saved successfully!');
       return true;

@@ -59,7 +59,6 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
         setEnvContent,
         activeTab,
         setActiveTab,
-        envExists,
         envFiles,
         selectedEnvFile,
         changeEnvFile,
@@ -82,14 +81,13 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
     // alone the textarea would show compose while a save silently no-ops on 'files'.
     // Normalize to 'compose' so the visible edit always saves to the visible file.
     useEffect(() => {
-        if (activeTab === 'files' || (activeTab === 'env' && !envExists)) {
+        if (activeTab === 'files') {
             setActiveTab('compose');
         }
-    }, [activeTab, envExists, setActiveTab]);
+    }, [activeTab, setActiveTab]);
 
-    // Mirror of the normalization above for this render: 'env' only when an env
-    // file exists, else 'compose'. The effect makes the shared activeTab follow.
-    const tab: 'compose' | 'env' = activeTab === 'env' && envExists ? 'env' : 'compose';
+    // Allow env tab even if env doesn't exist
+    const tab: 'compose' | 'env' = activeTab === 'env' ? 'env' : activeTab === 'compose' ? 'compose' : 'compose';
     const value = tab === 'compose' ? content || '' : envContent || '';
     // Switching the env file refetches and overwrites the env buffer, so block it
     // while there are unsaved edits (matches the desktop selector being disabled
@@ -121,38 +119,32 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
                         <ChevronLeft className="h-4 w-4" strokeWidth={1.6} />
                         Cancel
                     </button>
-                    {envExists ? (
-                        <div
-                            role="tablist"
-                            aria-label="File to edit"
-                            className="flex gap-1 rounded-lg border border-card-border bg-well p-1 shadow-[var(--shadow-well)]"
-                        >
-                            {(['compose', 'env'] as const).map(id => {
-                                const on = tab === id;
-                                return (
-                                    <button
-                                        key={id}
-                                        type="button"
-                                        role="tab"
-                                        aria-selected={on}
-                                        onClick={() => setActiveTab(id)}
-                                        className={cn(
-                                            'rounded-md px-3 py-1.5 font-mono text-[11px] lowercase tracking-[0.08em] transition-colors',
-                                            on
-                                                ? 'bg-card text-stat-value shadow-card-bevel'
-                                                : 'text-stat-subtitle hover:text-foreground',
-                                        )}
-                                    >
-                                        {id === 'compose' ? 'compose' : '.env'}
-                                    </button>
-                                );
-                            })}
-                        </div>
-                    ) : (
-                        <span className="font-mono text-[11px] lowercase tracking-[0.08em] text-stat-subtitle">
-                            compose.yaml
-                        </span>
-                    )}
+                    <div
+                        role="tablist"
+                        aria-label="File to edit"
+                        className="flex gap-1 rounded-lg border border-card-border bg-well p-1 shadow-[var(--shadow-well)]"
+                    >
+                        {(['compose', 'env'] as const).map(id => {
+                            const on = tab === id;
+                            return (
+                                <button
+                                    key={id}
+                                    type="button"
+                                    role="tab"
+                                    aria-selected={on}
+                                    onClick={() => setActiveTab(id)}
+                                    className={cn(
+                                        'rounded-md px-3 py-1.5 font-mono text-[11px] lowercase tracking-[0.08em] transition-colors',
+                                        on
+                                            ? 'bg-card text-stat-value shadow-card-bevel'
+                                            : 'text-stat-subtitle hover:text-foreground',
+                                    )}
+                                >
+                                    {id === 'compose' ? 'compose' : '.env'}
+                                </button>
+                            );
+                        })}
+                    </div>
                 </div>
 
                 {tab === 'env' && envFiles.length > 1 && (
@@ -170,7 +162,6 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
                     </Select>
                 )}
             </div>
-
             {/* Editor */}
             <div className="min-h-0 flex-1 overflow-hidden p-3">
                 <textarea
