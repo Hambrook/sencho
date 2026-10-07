@@ -426,6 +426,8 @@ export function FleetView({
                 canManageNode={detailsNodeId !== null && can('node:manage', 'node', String(detailsNodeId))}
                 onOpenNetworking={onOpenNodeNetworking}
                 onEdit={openEdit}
+                onDelete={openDelete}
+                onCordonChange={() => { void overview.fetchOverview(true); }}
             />
 
             <LocalUpdateConfirmDialog
