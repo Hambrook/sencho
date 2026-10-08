@@ -736,7 +736,7 @@ export function EditorView(props: EditorViewProps) {
                                             {!envExists && canEditCompose && (
                                                 <div className="flex items-center gap-2">
                                                     <span>
-                                                        This stack has no environment file yet. A <code className="bg-background px-1 rounded text-[10px]">.env</code> file will be created in the stack directory when you save.
+                                                        This stack has no environment file yet. One will be created in the stack directory when you save.
                                                     </span>
                                                 </div>
                                             )}

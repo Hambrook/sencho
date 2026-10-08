@@ -15,6 +15,8 @@ import request from 'supertest';
 import fs from 'fs';
 import path from 'path';
 import { setupTestDb, cleanupTestDb, loginAsTestAdmin } from './helpers/setupTestDb';
+import { DatabaseService } from '../services/DatabaseService';
+import { NodeRegistry } from '../services/NodeRegistry';
 
 let tmpDir: string;
 let composeDir: string;
@@ -61,6 +63,9 @@ beforeEach(() => {
   if (fs.existsSync(stackDir)) {
     fs.rmSync(stackDir, { recursive: true, force: true });
   }
+  // Project env files are stack-scoped database state, not part of the temp
+  // compose dir; reset so a configured-file test cannot leak into the next one.
+  DatabaseService.getInstance().setStackProjectEnvFiles(NodeRegistry.getInstance().getDefaultNodeId(), STACK, []);
 });
 
 describe('GET /api/stacks/:stackName emits ETag with mtime', () => {
@@ -282,18 +287,138 @@ describe('PUT /api/stacks/:stackName/env optimistic concurrency', () => {
     expect(fs.existsSync(path.join(composeDir, missing))).toBe(false);
   });
 
-  it('writes the existing env file normally when create is set on a stack that has one', async () => {
+  it('returns a conflict instead of overwriting when create is set and the env file exists', async () => {
+    // A stale editor (the file appeared after the tab loaded) sends create=1
+    // with no If-Match. The exclusive create must fail with the same 412 shape
+    // the optimistic-concurrency path uses, and leave the file untouched.
     seedStack(STACK, 'services: {}');
-    const envPath = seedEnv(STACK, 'FOO=1');
+    const envPath = seedEnv(STACK, 'SECRET=keepme');
 
     const putRes = await request(app)
       .put(`/api/stacks/${STACK}/env?create=1`)
       .set('Cookie', authCookie)
       .send({ content: 'FOO=2' });
 
+    expect(putRes.status).toBe(412);
+    expect(putRes.body.code).toBe('stack_file_changed');
+    expect(putRes.body.currentContent).toBe('SECRET=keepme');
+    expect(putRes.body.envPath).toBe(envPath);
+    expect(fs.readFileSync(envPath, 'utf-8')).toBe('SECRET=keepme');
+  });
+
+  it('overwrites on the forced create retry after the conflict confirmation', async () => {
+    seedStack(STACK, 'services: {}');
+    const envPath = seedEnv(STACK, 'SECRET=keepme');
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1&force=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=2' });
+
     expect(putRes.status).toBe(200);
     expect(putRes.body.created).toBeUndefined();
+    expect(putRes.body.envPath).toBe(envPath);
     expect(fs.readFileSync(envPath, 'utf-8')).toBe('FOO=2');
+  });
+
+  it('pins the forced create retry to the file the editor confirmed', async () => {
+    // The confirm dialog named one file; the retry must write that file, not
+    // whatever the resolver would pick again after a config change.
+    seedStack(STACK, 'services: {}');
+    const nodeId = NodeRegistry.getInstance().getDefaultNodeId();
+    DatabaseService.getInstance().setStackProjectEnvFiles(nodeId, STACK, ['a.env', 'b.env']);
+    const aPath = path.join(composeDir, STACK, 'a.env');
+    const bPath = path.join(composeDir, STACK, 'b.env');
+    fs.writeFileSync(aPath, 'A=1', 'utf-8');
+    fs.writeFileSync(bPath, 'B=1', 'utf-8');
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1&force=1&file=${encodeURIComponent(bPath)}`)
+      .set('Cookie', authCookie)
+      .send({ content: 'B=2' });
+
+    expect(putRes.status).toBe(200);
+    expect(putRes.body.envPath).toBe(bPath);
+    expect(fs.readFileSync(bPath, 'utf-8')).toBe('B=2');
+    expect(fs.readFileSync(aPath, 'utf-8')).toBe('A=1');
+  });
+
+  it('refuses a create when every configured project env file escapes the stack', async () => {
+    // A stale or hand-edited config row must not turn the first save into a
+    // write outside the stack directory.
+    seedStack(STACK, 'services: {}');
+    const nodeId = NodeRegistry.getInstance().getDefaultNodeId();
+    DatabaseService.getInstance().setStackProjectEnvFiles(nodeId, STACK, ['../escape.env']);
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=1' });
+
+    expect(putRes.status).toBe(409);
+    expect(fs.existsSync(path.join(composeDir, 'escape.env'))).toBe(false);
+  });
+
+  it('creates the configured project env file and leaves a stray .env untouched', async () => {
+    // With project env files configured, Compose reads those instead of .env.
+    // The first save must create the configured file, and a .env left on disk
+    // (not an env source in that state) must not be overwritten.
+    seedStack(STACK, 'services: {}');
+    const strayEnv = seedEnv(STACK, 'SECRET=keepme');
+    const nodeId = NodeRegistry.getInstance().getDefaultNodeId();
+    DatabaseService.getInstance().setStackProjectEnvFiles(nodeId, STACK, ['custom.env']);
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=1' });
+
+    expect(putRes.status).toBe(200);
+    expect(putRes.body.created).toBe(true);
+    const createdPath = putRes.body.envPath as string;
+    expect(createdPath).toBe(path.join(composeDir, STACK, 'custom.env'));
+    expect(fs.readFileSync(createdPath, 'utf-8')).toBe('FOO=1');
+    expect(fs.readFileSync(strayEnv, 'utf-8')).toBe('SECRET=keepme');
+
+    // The created file is a real env source now, so /envs lists it and the
+    // next save through the returned path is accepted.
+    const envsRes = await request(app)
+      .get(`/api/stacks/${STACK}/envs`)
+      .set('Cookie', authCookie);
+    expect(envsRes.body.envFiles).toEqual([createdPath]);
+
+    const secondRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?file=${encodeURIComponent(createdPath)}`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=2' });
+
+    expect(secondRes.status).toBe(200);
+    expect(fs.readFileSync(createdPath, 'utf-8')).toBe('FOO=2');
+  });
+
+  it('ignores force on the non-create save path', async () => {
+    // force is a create-path flag: the editor's normal forced retry works by
+    // omitting If-Match, so force=1 here must not bypass a stale precondition.
+    seedStack(STACK, 'services: {}');
+    const envPath = seedEnv(STACK, 'FOO=1');
+
+    const getRes = await request(app)
+      .get(`/api/stacks/${STACK}/env?file=${encodeURIComponent(envPath)}`)
+      .set('Cookie', authCookie);
+    const etag = getRes.headers.etag as string;
+
+    fs.writeFileSync(envPath, 'FOO=bumped', 'utf-8');
+    const future = Date.now() + 5_000;
+    fs.utimesSync(envPath, future / 1000, future / 1000);
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?force=1&file=${encodeURIComponent(envPath)}`)
+      .set('Cookie', authCookie)
+      .set('If-Match', etag)
+      .send({ content: 'FOO=2' });
+
+    expect(putRes.status).toBe(412);
+    expect(fs.readFileSync(envPath, 'utf-8')).toBe('FOO=bumped');
   });
 
   it('returns 412 on env-file mtime mismatch', async () => {

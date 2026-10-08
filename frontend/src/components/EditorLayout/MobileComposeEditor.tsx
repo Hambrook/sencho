@@ -166,7 +166,7 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
             </div>
             {tab === 'env' && !envExists && canEdit && (
                 <p className="shrink-0 border-b border-hairline bg-brand/8 px-4 py-2 font-mono text-[11px] leading-snug text-brand">
-                    This stack has no environment file yet. A .env file will be created in the stack directory when you save.
+                    This stack has no environment file yet. It will be created in the stack directory when you save.
                 </p>
             )}
             {/* Editor */}

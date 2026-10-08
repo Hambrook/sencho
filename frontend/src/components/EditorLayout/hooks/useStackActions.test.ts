@@ -299,6 +299,107 @@ describe('useStackActions.saveFile', () => {
     expect(String(call?.[0])).toBe(`/stacks/web.yml/env?file=${encodeURIComponent('/compose/web/.env')}`);
     expect(String(call?.[0])).not.toContain('create=1');
   });
+
+  it('adopts the existing file and retries with force when the create save conflicts', async () => {
+    const conflict = new Response(
+      JSON.stringify({
+        error: "web's env file already exists.",
+        code: 'stack_file_changed',
+        currentContent: 'SECRET=keepme',
+        envPath: '/compose/web/.env',
+      }),
+      { status: 412, headers: { 'Content-Type': 'application/json', ETag: 'W/"111"' } },
+    );
+    const saved = okJson({ message: 'Env file saved successfully', mtimeMs: 222, envPath: '/compose/web/.env' });
+    vi.mocked(apiFetch).mockResolvedValueOnce(conflict).mockResolvedValueOnce(saved);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    try {
+      const { result, editorState } = setup({
+        editorState: {
+          activeTab: 'env',
+          envExists: false,
+          selectedEnvFile: '',
+          envContent: 'FOO=1',
+          originalEnvContent: '',
+        },
+      });
+
+      const ok = await result.current.saveFile();
+
+      expect(ok).toBe(true);
+      const puts = vi.mocked(apiFetch).mock.calls.filter(
+        c => String(c[0]).includes('/stacks/web.yml/env') && (c[1] as RequestInit | undefined)?.method === 'PUT',
+      );
+      expect(String(puts[0]?.[0])).toBe('/stacks/web.yml/env?create=1');
+      expect(String(puts[1]?.[0])).toBe(
+        `/stacks/web.yml/env?create=1&force=1&file=${encodeURIComponent('/compose/web/.env')}`,
+      );
+      // The conflict response adopts the real file so the notice clears, and
+      // the forced retry's success response keeps that state.
+      expect(editorState.setEnvExists).toHaveBeenCalledWith(true);
+      expect(editorState.setSelectedEnvFile).toHaveBeenCalledWith('/compose/web/.env');
+      expect(editorState.setEnvFiles).toHaveBeenCalledWith(['/compose/web/.env']);
+      expect(editorState.setOriginalEnvContent).toHaveBeenCalledWith('FOO=1');
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+
+  it('reloads and adopts the existing file when the create conflict is declined', async () => {
+    const conflict = new Response(
+      JSON.stringify({ currentContent: 'SECRET=keepme', envPath: '/compose/web/.env' }),
+      { status: 412, headers: { 'Content-Type': 'application/json', ETag: 'W/"111"' } },
+    );
+    vi.mocked(apiFetch).mockResolvedValue(conflict);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    try {
+      const { result, editorState } = setup({
+        editorState: {
+          activeTab: 'env',
+          envExists: false,
+          selectedEnvFile: '',
+          envContent: 'FOO=1',
+          originalEnvContent: '',
+        },
+      });
+
+      const ok = await result.current.saveFile();
+
+      expect(ok).toBe(false);
+      expect(editorState.setEnvContent).toHaveBeenCalledWith('SECRET=keepme');
+      expect(editorState.setOriginalEnvContent).toHaveBeenCalledWith('SECRET=keepme');
+      expect(editorState.setEnvEtag).toHaveBeenCalledWith('W/"111"');
+      expect(editorState.setEnvExists).toHaveBeenCalledWith(true);
+      expect(editorState.setSelectedEnvFile).toHaveBeenCalledWith('/compose/web/.env');
+      expect(editorState.setEnvFiles).toHaveBeenCalledWith(['/compose/web/.env']);
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+
+  it('leaves the create state unchanged when a 200 has no resolved path', async () => {
+    vi.mocked(apiFetch).mockResolvedValue(okJson({ message: 'Env file saved successfully', mtimeMs: 123 }));
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { result, editorState } = setup({
+        editorState: {
+          activeTab: 'env',
+          envExists: false,
+          selectedEnvFile: '',
+          envContent: 'FOO=1',
+          originalEnvContent: '',
+        },
+      });
+
+      const ok = await result.current.saveFile();
+
+      expect(ok).toBe(true);
+      expect(editorState.setEnvExists).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });
 
 // Shared by the save-then-deploy and save-then-pull blocks: both assert on the

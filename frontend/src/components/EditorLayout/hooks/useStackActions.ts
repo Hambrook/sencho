@@ -1229,22 +1229,26 @@ export function useStackActions(options: UseStackActionsOptions) {
     }
   };
 
-  const saveFile = async (options?: { force?: boolean }): Promise<boolean> => {
+  const saveFile = async (options?: { force?: boolean; envPath?: string }): Promise<boolean> => {
     if (editorState.activeTab === 'files') return false;
     if (!stackListState.selectedFile) return false;
     const force = options?.force === true;
+    const pinnedEnvPath = options?.envPath;
     const isCompose = editorState.activeTab === 'compose';
     const currentContent = isCompose
       ? editorState.content || ''
       : editorState.envContent || '';
     // The env tab opens before an env file exists. Its first save asks the
-    // backend to create the default .env and returns the resolved path, which
-    // becomes the selected file so later saves target it directly.
+    // backend to create the file Compose reads and returns the resolved path,
+    // which becomes the selected file so later saves target it directly. A
+    // confirmed overwrite after a create conflict retries with force=1 and
+    // pins the exact file the conflict named, so a config change between the
+    // two requests cannot move the write to another file.
     const creatingEnv = !isCompose && !editorState.envExists;
     const endpoint = isCompose
       ? `/stacks/${stackListState.selectedFile}`
       : creatingEnv
-        ? `/stacks/${stackListState.selectedFile}/env?create=1`
+        ? `/stacks/${stackListState.selectedFile}/env?create=1${force ? '&force=1' : ''}${pinnedEnvPath ? `&file=${encodeURIComponent(pinnedEnvPath)}` : ''}`
         : `/stacks/${stackListState.selectedFile}/env?file=${encodeURIComponent(editorState.selectedEnvFile)}`;
     const etag = isCompose ? editorState.composeEtag : editorState.envEtag;
     const headers: Record<string, string> = {};
@@ -1264,14 +1268,23 @@ export function useStackActions(options: UseStackActionsOptions) {
         const payload = await response.json().catch(() => null);
         const currentRemoteContent =
           payload && typeof payload.currentContent === 'string' ? payload.currentContent : '';
+        const conflictPath =
+          payload && typeof payload.envPath === 'string' ? payload.envPath : '';
+        // A create conflict means the file appeared after the tab loaded. Adopt
+        // it so the notice clears and later saves target the real file.
+        if (creatingEnv && conflictPath) {
+          editorState.setEnvExists(true);
+          editorState.setSelectedEnvFile(conflictPath);
+          editorState.setEnvFiles([conflictPath]);
+        }
         const fileName = isCompose
           ? 'compose.yaml'
-          : (editorState.selectedEnvFile || '.env').split('/').pop() ?? '.env';
+          : (conflictPath || editorState.selectedEnvFile || '.env').split('/').pop() ?? '.env';
         const confirmed = window.confirm(
           `${fileName} was changed by another tab or process. Overwrite their changes with yours? Click Cancel to discard your local edits and reload the latest version.`,
         );
         if (confirmed) {
-          return await saveFile({ force: true });
+          return await saveFile({ force: true, envPath: conflictPath || undefined });
         }
         if (isCompose) {
           editorState.setContent(currentRemoteContent);
@@ -1296,24 +1309,21 @@ export function useStackActions(options: UseStackActionsOptions) {
         editorState.setOriginalEnvContent(editorState.envContent);
         if (newEtag) editorState.setEnvEtag(newEtag);
         if (creatingEnv) {
-          // Create path only: adopt the resolved path the backend returns so
-          // the next save targets the created file instead of failing the
-          // allowed-file check with a relative name.
+          // Create path: adopt the resolved path the backend returns so the
+          // next save targets the real file instead of failing the allowed-file
+          // check. Present for both a fresh create and the forced overwrite.
           const payload = (await response.json().catch(() => null)) as
-            { created?: unknown; envPath?: unknown } | null;
+            { envPath?: unknown } | null;
           const createdPath =
-            payload && payload.created === true && typeof payload.envPath === 'string'
-              ? payload.envPath
-              : '';
+            payload && typeof payload.envPath === 'string' ? payload.envPath : '';
           if (createdPath) {
             editorState.setEnvExists(true);
             editorState.setSelectedEnvFile(createdPath);
             editorState.setEnvFiles([createdPath]);
           } else {
-            // A 200 without the resolved path is unexpected (a proxy mangling the
-            // body). The next save still resolves server-side because the create
-            // flag is ignored once an env file exists, so surface it only as a
-            // diagnostic rather than a failed save.
+            // A 200 without the resolved path is unexpected. The next save still
+            // cannot overwrite anything: the server treats create=1 as exclusive
+            // and answers 412 when a file exists.
             console.warn('[Editor] Env create response did not include the resolved path');
           }
         }

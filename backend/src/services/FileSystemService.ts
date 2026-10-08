@@ -1,7 +1,7 @@
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
-import { promises as fsPromises, createReadStream, createWriteStream } from 'fs';
+import { promises as fsPromises, constants as fsConstants, createReadStream, createWriteStream } from 'fs';
 import type { Dirent } from 'fs';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
@@ -483,6 +483,66 @@ export class FileSystemService {
     await fsPromises.writeFile(safePath, content, 'utf-8');
     const newStat = await fsPromises.stat(safePath);
     return { ok: true, mtimeMs: newStat.mtimeMs };
+  }
+
+  /**
+   * Exclusive create for the editor's first save on a stack with no env file.
+   * Fails when the target already exists so a stale client can never overwrite
+   * a file it has not read; the caller turns that into the same 412 conflict
+   * the optimistic-concurrency path uses. The path is resolved and contained
+   * like writeFileIfUnchanged.
+   */
+  async createFileExclusive(
+    untrustedTargetPath: string,
+    content: string,
+  ): Promise<
+    | { ok: true; mtimeMs: number }
+    | { ok: false; currentMtimeMs: number; currentContent: string }
+  > {
+    const baseResolved = path.resolve(this.baseDir);
+    const safePath = path.resolve(baseResolved, untrustedTargetPath);
+    if (!safePath.startsWith(baseResolved + path.sep)) {
+      throw Object.assign(new Error('Path escapes compose directory'), { code: 'INVALID_PATH' });
+    }
+    await this.assertRealWithinBase(safePath);
+
+    let fh: import('fs/promises').FileHandle | null = null;
+    try {
+      fh = await fsPromises.open(safePath, 'wx');
+      await fh.writeFile(content, 'utf-8');
+      await fh.close();
+      fh = null;
+      const newStat = await fsPromises.stat(safePath);
+      return { ok: true, mtimeMs: newStat.mtimeMs };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        // The path exists. A symlink can be planted at the target between the
+        // pre-open containment check and the failed exclusive open, so repeat
+        // the check and read through a handle that never follows a link: the
+        // conflict payload must not become a way to read outside the compose
+        // root. A vanished or linked target is refused as an invalid path;
+        // EISDIR propagates and the route answers 409.
+        await this.assertRealWithinBase(safePath);
+        let reader: import('fs/promises').FileHandle | null = null;
+        try {
+          reader = await fsPromises.open(safePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+          const stat = await reader.stat();
+          const currentContent = await reader.readFile('utf-8');
+          return { ok: false, currentMtimeMs: stat.mtimeMs, currentContent };
+        } catch (readErr) {
+          const code = (readErr as NodeJS.ErrnoException).code;
+          if (code === 'ELOOP' || code === 'ENOENT') {
+            throw Object.assign(new Error('Env target is not a readable file'), { code: 'INVALID_PATH' });
+          }
+          throw readErr;
+        } finally {
+          if (reader) await reader.close();
+        }
+      }
+      throw err;
+    } finally {
+      if (fh) await fh.close();
+    }
   }
 
   async statMtime(untrustedTargetPath: string): Promise<number | null> {
