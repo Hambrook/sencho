@@ -277,7 +277,7 @@ describe('EditorView env creation affordance', () => {
     expect(lastReadOnly).toBe(true);
   });
 
-  it('hides the creation notice for a user who cannot edit the stack', () => {
+  it('shows the plain no-file line to a user who cannot edit the stack', () => {
     render(
       <EditorView
         {...makeProps({
@@ -291,6 +291,7 @@ describe('EditorView env creation affordance', () => {
     expect(
       screen.queryByText(/will be created in the stack directory when you save/),
     ).not.toBeInTheDocument();
+    expect(screen.getByText('This stack has no environment file yet.')).toBeInTheDocument();
   });
 });
 

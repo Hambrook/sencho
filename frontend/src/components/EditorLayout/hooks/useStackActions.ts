@@ -11,6 +11,7 @@ import {
   type SpanHandle,
 } from '@/lib/hydrationTiming';
 import { toast } from '@/components/ui/toast-store';
+import { ENV_READ_FAILED_NOTICE } from '../envNotice';
 import { buildServiceUrl, openServiceUrl } from '@/lib/serviceUrl';
 import { requestServiceUpdate as postServiceUpdate, requestServiceRestore as postServiceRestore } from '@/lib/serviceUpdate';
 import type { EffectiveServiceModelResult } from '@/types/effectiveServices';
@@ -1268,7 +1269,7 @@ export function useStackActions(options: UseStackActionsOptions) {
     // A failed inventory load is an unknown state, not an absent file: never
     // offer or perform a create over it.
     if (creatingEnv && editorState.envInventoryFailed) {
-      toast.error('The environment file list could not be loaded. Reload the editor before saving.');
+      toast.error(ENV_READ_FAILED_NOTICE);
       return false;
     }
     // Save & Deploy / Save & Pull on an untouched, still-empty env tab have
@@ -1370,6 +1371,31 @@ export function useStackActions(options: UseStackActionsOptions) {
             toast.error('Could not reload the environment files. Reload the editor before saving.');
             return false;
           }
+        } else if (creatingEnv && conflictPath) {
+          // The conflict named a file the editor had not loaded. Re-read the
+          // env state instead of trusting the payload: the file can be removed
+          // while the dialog is open, and adopting a path that no longer
+          // exists would fail the allowed-file check on every later save. A
+          // successful refresh adopts what is on disk now, or returns the
+          // editor to create mode when nothing is left.
+          const refreshed = await loadEnvState(stackListState.selectedFile, opLoadSignal, opNodeId);
+          if (opLoadSignal?.aborted) return false;
+          if (!refreshed.ok) {
+            // Keep the conflicted content visible under its ETag; the
+            // unknown-state guard refuses the next save instead of writing
+            // over something unread.
+            editorState.setEnvContent(currentRemoteContent);
+            editorState.setOriginalEnvContent(currentRemoteContent);
+            editorState.setEnvEtag(response.headers.get('etag'));
+            toast.error('Could not reload the environment files. Reload the editor before saving.');
+            return false;
+          }
+          if (refreshed.files.length === 0) {
+            // The file vanished while the dialog was open; the refresh left
+            // the editor in create mode, so the next save creates it.
+            toast.info('The environment file no longer exists. Saving will create it.');
+            return false;
+          }
         } else {
           editorState.setEnvContent(currentRemoteContent);
           editorState.setOriginalEnvContent(currentRemoteContent);
@@ -1379,7 +1405,18 @@ export function useStackActions(options: UseStackActionsOptions) {
         return false;
       }
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+        // Surface the server's error text, not the raw JSON envelope: a failed
+        // save (404 vanished stack, 409 unusable path, 413 too large) is shown
+        // to the operator in a toast.
+        const bodyText = await response.text().catch(() => '');
+        let serverError = '';
+        try {
+          const parsed = JSON.parse(bodyText) as { error?: unknown } | null;
+          if (parsed && typeof parsed.error === 'string') serverError = parsed.error;
+        } catch {
+          // Non-JSON body (e.g. a proxy error page): fall back to the status.
+        }
+        throw new Error(serverError || `HTTP ${response.status}`);
       }
       // If the editor moved to another stack while the PUT was in flight, the
       // new load owns the state: the write succeeded, but none of this

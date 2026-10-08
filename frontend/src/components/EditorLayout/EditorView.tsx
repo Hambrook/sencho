@@ -737,12 +737,14 @@ export function EditorView(props: EditorViewProps) {
                                                     Variables defined in the project environment file are available for substitution in your compose.yaml (e.g., <code className="bg-background px-1 rounded text-[10px]">${'{}'}VAR</code>). To pass them directly into your container, add <code className="bg-background px-1 rounded text-[10px]">env_file: - .env</code> to your service definition.
                                                 </span>
                                             </div>
-                                            {!envExists && canEditCompose && (
+                                            {!envExists && (
                                                 <div className="flex items-center gap-2">
                                                     <span>
                                                         {envInventoryFailed
                                                             ? ENV_READ_FAILED_NOTICE
-                                                            : 'This stack has no environment file yet. One will be created in the stack directory when you save.'}
+                                                            : canEditCompose
+                                                                ? 'This stack has no environment file yet. One will be created in the stack directory when you save.'
+                                                                : 'This stack has no environment file yet.'}
                                                     </span>
                                                 </div>
                                             )}

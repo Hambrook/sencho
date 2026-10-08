@@ -19,6 +19,7 @@ vi.mock('@/components/ui/toast-store', () => ({
 }));
 
 import { apiFetch } from '@/lib/api';
+import { ENV_READ_FAILED_NOTICE } from '../envNotice';
 import {
   absentRevision,
   missingApplicationLimitation,
@@ -318,7 +319,7 @@ describe('useStackActions.saveFile', () => {
 
     expect(ok).toBe(false);
     expect(apiFetch).not.toHaveBeenCalled();
-    expect(toast.error).toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith(ENV_READ_FAILED_NOTICE);
   });
 
   it('records a failed env inventory load as failed instead of empty', async () => {
@@ -418,6 +419,32 @@ describe('useStackActions.saveFile', () => {
     expect(String(call?.[0])).not.toContain('create=1');
   });
 
+  it('shows the server error text when a save fails instead of the raw JSON envelope', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: 'Requested env file not allowed' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const { result } = setup({
+      editorState: {
+        activeTab: 'env',
+        envExists: true,
+        selectedEnvFile: '/compose/web/.env',
+        envContent: 'FOO=2',
+        originalEnvContent: 'FOO=1',
+      },
+    });
+
+    const ok = await result.current.saveFile();
+
+    expect(ok).toBe(false);
+    expect(toast.error).toHaveBeenCalledWith('Failed to save file: Requested env file not allowed');
+    expect(
+      vi.mocked(toast.error).mock.calls.some(c => String(c[0]).includes('HTTP 400')),
+    ).toBe(false);
+  });
+
   it('adopts the existing file and retries with force when the create save conflicts', async () => {
     const conflict = new Response(
       JSON.stringify({
@@ -476,7 +503,12 @@ describe('useStackActions.saveFile', () => {
       JSON.stringify({ currentContent: 'SECRET=keepme', envPath: '/compose/web/.env' }),
       { status: 412, headers: { 'Content-Type': 'application/json', ETag: 'W/"111"' } },
     );
-    vi.mocked(apiFetch).mockResolvedValue(conflict);
+    // Declining reloads the env state instead of trusting the payload, so the
+    // editor adopts whatever is on disk now.
+    vi.mocked(apiFetch)
+      .mockResolvedValueOnce(conflict)
+      .mockResolvedValueOnce(okJson({ envFiles: ['/compose/web/.env'] }))
+      .mockResolvedValueOnce(new Response('SECRET=keepme', { status: 200, headers: { ETag: 'W/"111"' } }));
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     try {
       const { result, editorState } = setup({
@@ -498,6 +530,44 @@ describe('useStackActions.saveFile', () => {
       expect(editorState.setEnvExists).toHaveBeenCalledWith(true);
       expect(editorState.setSelectedEnvFile).toHaveBeenCalledWith('/compose/web/.env');
       expect(editorState.setEnvFiles).toHaveBeenCalledWith(['/compose/web/.env']);
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+
+  it('returns to create mode when the conflicted file is gone by the time the decline reloads', async () => {
+    // The file was deleted while the dialog was open and the operator chose
+    // Cancel. Adopting the vanished path would make every later save fail the
+    // allowed-file check; the reload must leave the editor in create mode.
+    const conflict = new Response(
+      JSON.stringify({ currentContent: 'SECRET=keepme', envPath: '/compose/web/.env' }),
+      { status: 412, headers: { 'Content-Type': 'application/json', ETag: 'W/"111"' } },
+    );
+    vi.mocked(apiFetch)
+      .mockResolvedValueOnce(conflict)
+      .mockResolvedValueOnce(okJson({ envFiles: [] }));
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    try {
+      const { result, editorState } = setup({
+        editorState: {
+          activeTab: 'env',
+          envExists: false,
+          selectedEnvFile: '',
+          envContent: 'FOO=1',
+          originalEnvContent: '',
+        },
+      });
+
+      const ok = await result.current.saveFile();
+
+      expect(ok).toBe(false);
+      // clearEnvState leaves no adopted path and no buffer.
+      expect(editorState.setEnvExists).toHaveBeenLastCalledWith(false);
+      expect(editorState.setSelectedEnvFile).toHaveBeenLastCalledWith('');
+      expect(editorState.setEnvFiles).toHaveBeenLastCalledWith([]);
+      expect(
+        vi.mocked(toast.info).mock.calls.some(c => String(c[0]).includes('no longer exists')),
+      ).toBe(true);
     } finally {
       confirmSpy.mockRestore();
     }

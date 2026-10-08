@@ -848,6 +848,13 @@ stacksRouter.put('/:stackName/env', async (req: Request, res: Response) => {
     if (requestedFile) {
       if (envPaths.includes(requestedFile)) {
         envPath = requestedFile;
+      } else if (createRequested && requestedFile === createTarget) {
+        // The editor's confirmed create retry pins the file the conflict named.
+        // That file can vanish before the retry (deleted while the dialog was
+        // open); it is still the file the resolver would create, so allow the
+        // retry to recreate it instead of stranding the editor on a 400. Any
+        // other pinned path keeps the scoped rejection.
+        envPath = requestedFile;
       } else {
         return res.status(400).json({ error: 'Requested env file not allowed' });
       }

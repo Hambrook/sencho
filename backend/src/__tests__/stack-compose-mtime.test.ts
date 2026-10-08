@@ -521,15 +521,47 @@ describe('PUT /api/stacks/:stackName/env optimistic concurrency', () => {
         return true;
       });
 
-    const putRes = await request(app)
+    try {
+      const putRes = await request(app)
+        .put(`/api/stacks/${STACK}/env?create=1`)
+        .set('Cookie', authCookie)
+        .send({ content: 'FOO=1' });
+
+      expect(putRes.status).toBe(404);
+      expect(putRes.body.error).toBe('Stack not found');
+      expect(fs.existsSync(stackDir)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('recreates the pinned file when it is deleted between the conflict and the confirmed retry', async () => {
+    // The editor loaded with no env file, another actor created .env, and the
+    // save conflicted. The file is then deleted while the operator reads the
+    // dialog. The confirmed retry pins the vanished path; it is still the
+    // resolved create target, so the route must recreate it rather than 400
+    // and strand the editor on a path it has already adopted.
+    seedStack(STACK, 'services: {}');
+    const envPath = path.join(composeDir, STACK, '.env');
+    fs.writeFileSync(envPath, 'OTHER=1', 'utf-8');
+
+    const firstRes = await request(app)
       .put(`/api/stacks/${STACK}/env?create=1`)
       .set('Cookie', authCookie)
-      .send({ content: 'FOO=1' });
+      .send({ content: 'MINE=1' });
 
-    expect(putRes.status).toBe(404);
-    expect(putRes.body.error).toBe('Stack not found');
-    expect(fs.existsSync(stackDir)).toBe(false);
-    spy.mockRestore();
+    expect(firstRes.status).toBe(412);
+    expect(firstRes.body.envPath).toBe(envPath);
+
+    fs.rmSync(envPath);
+
+    const retryRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1&force=1&file=${encodeURIComponent(envPath)}`)
+      .set('Cookie', authCookie)
+      .send({ content: 'MINE=1' });
+
+    expect(retryRes.status).toBe(200);
+    expect(fs.readFileSync(envPath, 'utf-8')).toBe('MINE=1');
   });
 
   it('ignores force on the non-create save path', async () => {
