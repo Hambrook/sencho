@@ -16,6 +16,7 @@ import {
     DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import type { StackAction } from './EditorView';
+import { ENV_READ_FAILED_NOTICE } from './envNotice';
 
 interface MobileComposeEditorProps {
     content: string;
@@ -25,6 +26,8 @@ interface MobileComposeEditorProps {
     activeTab: 'compose' | 'env' | 'files';
     setActiveTab: (tab: 'compose' | 'env' | 'files') => void;
     envExists: boolean;
+    /** The env inventory request failed; unknown is not the same as absent. */
+    envInventoryFailed: boolean;
     envFiles: string[];
     selectedEnvFile: string;
     changeEnvFile: (file: string) => Promise<void>;
@@ -60,6 +63,7 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
         activeTab,
         setActiveTab,
         envExists,
+        envInventoryFailed,
         envFiles,
         selectedEnvFile,
         changeEnvFile,
@@ -104,7 +108,7 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
     const saveAndDeployDisabled = saveDisabled || !actionsReady;
     // Read-only while an env-file fetch is in flight: changeEnvFile overwrites the
     // buffer when it resolves, so edits typed during the load would be silently lost.
-    const editorReadOnly = !canEdit || isFileLoading;
+    const editorReadOnly = !canEdit || isFileLoading || (tab === 'env' && !envExists && envInventoryFailed);
 
     return (
         <div className="flex h-full min-h-0 flex-col">
@@ -166,7 +170,9 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
             </div>
             {tab === 'env' && !envExists && canEdit && (
                 <p className="shrink-0 border-b border-hairline bg-brand/8 px-4 py-2 font-mono text-[11px] leading-snug text-brand">
-                    This stack has no environment file yet. It will be created in the stack directory when you save.
+                    {envInventoryFailed
+                        ? ENV_READ_FAILED_NOTICE
+                        : 'This stack has no environment file yet. It will be created in the stack directory when you save.'}
                 </p>
             )}
             {/* Editor */}

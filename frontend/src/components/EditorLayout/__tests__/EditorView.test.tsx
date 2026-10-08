@@ -52,6 +52,7 @@ function makeProps(over: Partial<EditorViewProps> = {}): EditorViewProps {
     content: '',
     envContent: '',
     envExists: false,
+    envInventoryFailed: false,
     envFiles: [],
     selectedEnvFile: '',
     isFileLoading: false,
@@ -256,6 +257,24 @@ describe('EditorView env creation affordance', () => {
     expect(
       screen.queryByText(/will be created in the stack directory when you save/),
     ).not.toBeInTheDocument();
+  });
+
+  it('shows an inventory-failure notice instead of the creation notice and locks the buffer', () => {
+    render(
+      <EditorView
+        {...makeProps({
+          editingCompose: true,
+          activeTab: 'env',
+          envExists: false,
+          envInventoryFailed: true,
+        })}
+      />,
+    );
+    expect(
+      screen.queryByText(/will be created in the stack directory when you save/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(/environment files could not be loaded/)).toBeInTheDocument();
+    expect(lastReadOnly).toBe(true);
   });
 
   it('hides the creation notice for a user who cannot edit the stack', () => {

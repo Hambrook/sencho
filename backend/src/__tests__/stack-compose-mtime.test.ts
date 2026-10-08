@@ -321,26 +321,114 @@ describe('PUT /api/stacks/:stackName/env optimistic concurrency', () => {
     expect(fs.readFileSync(envPath, 'utf-8')).toBe('FOO=2');
   });
 
-  it('pins the forced create retry to the file the editor confirmed', async () => {
-    // The confirm dialog named one file; the retry must write that file, not
-    // whatever the resolver would pick again after a config change.
+  it('pins the forced create retry to the file the conflict named', async () => {
+    // Reachable create flow: the tab loaded while the configured custom.env was
+    // missing (no env file resolved), then the file appeared before the save.
+    // The conflict names it, and the retry must write exactly that file.
     seedStack(STACK, 'services: {}');
     const nodeId = NodeRegistry.getInstance().getDefaultNodeId();
-    DatabaseService.getInstance().setStackProjectEnvFiles(nodeId, STACK, ['a.env', 'b.env']);
-    const aPath = path.join(composeDir, STACK, 'a.env');
-    const bPath = path.join(composeDir, STACK, 'b.env');
-    fs.writeFileSync(aPath, 'A=1', 'utf-8');
-    fs.writeFileSync(bPath, 'B=1', 'utf-8');
+    DatabaseService.getInstance().setStackProjectEnvFiles(nodeId, STACK, ['custom.env']);
+    const customPath = path.join(composeDir, STACK, 'custom.env');
+    const strayPath = path.join(composeDir, STACK, '.env');
+    fs.writeFileSync(strayPath, 'SECRET=keepme', 'utf-8');
+    fs.writeFileSync(customPath, 'C=1', 'utf-8');
+
+    const conflictRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'C=2' });
+
+    expect(conflictRes.status).toBe(412);
+    expect(conflictRes.body.envPath).toBe(customPath);
+
+    const forcedRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1&force=1&file=${encodeURIComponent(customPath)}`)
+      .set('Cookie', authCookie)
+      .send({ content: 'C=2' });
+
+    expect(forcedRes.status).toBe(200);
+    expect(forcedRes.body.envPath).toBe(customPath);
+    expect(fs.readFileSync(customPath, 'utf-8')).toBe('C=2');
+    expect(fs.readFileSync(strayPath, 'utf-8')).toBe('SECRET=keepme');
+  });
+
+  it('creates normally with the precondition header the older-node client sends', async () => {
+    // The client sends If-Match: W/"0" on the non-forced create so a node that
+    // predates create-on-save answers 412 for an existing file instead of
+    // overwriting it. This build's exclusive create must ignore the header.
+    seedStack(STACK, 'services: {}');
 
     const putRes = await request(app)
-      .put(`/api/stacks/${STACK}/env?create=1&force=1&file=${encodeURIComponent(bPath)}`)
+      .put(`/api/stacks/${STACK}/env?create=1`)
       .set('Cookie', authCookie)
-      .send({ content: 'B=2' });
+      .set('If-Match', 'W/"0"')
+      .send({ content: 'FOO=1' });
 
     expect(putRes.status).toBe(200);
-    expect(putRes.body.envPath).toBe(bPath);
-    expect(fs.readFileSync(bPath, 'utf-8')).toBe('B=2');
-    expect(fs.readFileSync(aPath, 'utf-8')).toBe('A=1');
+    expect(putRes.body.created).toBe(true);
+    expect(fs.readFileSync(path.join(composeDir, STACK, '.env'), 'utf-8')).toBe('FOO=1');
+  });
+
+  it('answers 409 when the env target is a directory', async () => {
+    seedStack(STACK, 'services: {}');
+    const dirPath = path.join(composeDir, STACK, '.env');
+    fs.mkdirSync(dirPath);
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=1' });
+
+    expect(putRes.status).toBe(409);
+    expect(fs.statSync(dirPath).isDirectory()).toBe(true);
+  });
+
+  it('refuses a create through a symlink that escapes the stack without reading it', async () => {
+    seedStack(STACK, 'services: {}');
+    const outsidePath = path.join(tmpDir, 'outside.env');
+    fs.writeFileSync(outsidePath, 'OUTSIDE=secret', 'utf-8');
+    fs.symlinkSync(outsidePath, path.join(composeDir, STACK, '.env'));
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=1' });
+
+    expect(putRes.status).toBe(409);
+    expect(putRes.body.currentContent).toBeUndefined();
+    expect(fs.readFileSync(outsidePath, 'utf-8')).toBe('OUTSIDE=secret');
+  });
+
+  it('answers 409 when the default env path is a dangling symlink', async () => {
+    seedStack(STACK, 'services: {}');
+    const linkPath = path.join(composeDir, STACK, '.env');
+    fs.symlinkSync(path.join(composeDir, STACK, 'missing.env'), linkPath);
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=1' });
+
+    expect(putRes.status).toBe(409);
+    expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+  });
+
+  it('lets exactly one of two concurrent creates win', async () => {
+    seedStack(STACK, 'services: {}');
+
+    const [a, b] = await Promise.all([
+      request(app)
+        .put(`/api/stacks/${STACK}/env?create=1`)
+        .set('Cookie', authCookie)
+        .send({ content: 'A=1' }),
+      request(app)
+        .put(`/api/stacks/${STACK}/env?create=1`)
+        .set('Cookie', authCookie)
+        .send({ content: 'B=1' }),
+    ]);
+
+    expect([a.status, b.status].sort((x, y) => x - y)).toEqual([200, 412]);
+    expect(['A=1', 'B=1']).toContain(fs.readFileSync(path.join(composeDir, STACK, '.env'), 'utf-8'));
   });
 
   it('refuses a create when every configured project env file escapes the stack', async () => {

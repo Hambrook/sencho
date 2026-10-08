@@ -49,6 +49,7 @@ function makeProps(over: Partial<EditorViewProps> = {}): EditorViewProps {
         content: '',
         envContent: '',
         envExists: false,
+        envInventoryFailed: false,
         envFiles: [],
         selectedEnvFile: '',
         isFileLoading: false,
@@ -319,6 +320,18 @@ describe('MobileStackDetail mobile editing', () => {
         expect(
             screen.queryByText(/will be created in the stack directory when you save/),
         ).not.toBeInTheDocument();
+    });
+
+    it('shows the mobile inventory-failure notice instead of the creation notice', () => {
+        render(
+            <MobileStackDetail
+                {...makeProps({ editingCompose: true, activeTab: 'env', envExists: false, envInventoryFailed: true })}
+            />,
+        );
+        expect(
+            screen.queryByText(/will be created in the stack directory when you save/),
+        ).not.toBeInTheDocument();
+        expect(screen.getByText(/environment files could not be loaded/)).toBeInTheDocument();
     });
 
     it('blocks textarea edits while an env-file load is in flight', () => {

@@ -43,6 +43,7 @@ import { ScrollArea } from '../ui/scroll-area';
 import { AnatomyResizePane } from '@/components/stack/AnatomyResizePane';
 import { StackIdentityHeader, ContainersHealth, StackLogsSection } from './editor-view-blocks';
 import { MobileStackDetail } from './MobileStackDetail';
+import { ENV_READ_FAILED_NOTICE } from './envNotice';
 import { RecoveryChip } from './RecoveryChip';
 import { StackOperationBanner } from './StackOperationBanner';
 import { retryHandlerFor } from './recovery-retry';
@@ -137,6 +138,8 @@ export interface EditorViewProps {
     content: string;
     envContent: string;
     envExists: boolean;
+    /** The env inventory request failed; unknown is not the same as absent. */
+    envInventoryFailed: boolean;
     envFiles: string[];
     selectedEnvFile: string;
     isFileLoading: boolean;
@@ -260,6 +263,7 @@ export function EditorView(props: EditorViewProps) {
         content,
         envContent,
         envExists,
+        envInventoryFailed,
         envFiles,
         selectedEnvFile,
         isFileLoading,
@@ -736,7 +740,9 @@ export function EditorView(props: EditorViewProps) {
                                             {!envExists && canEditCompose && (
                                                 <div className="flex items-center gap-2">
                                                     <span>
-                                                        This stack has no environment file yet. One will be created in the stack directory when you save.
+                                                        {envInventoryFailed
+                                                            ? ENV_READ_FAILED_NOTICE
+                                                            : 'This stack has no environment file yet. One will be created in the stack directory when you save.'}
                                                     </span>
                                                 </div>
                                             )}
@@ -770,7 +776,7 @@ export function EditorView(props: EditorViewProps) {
                                                         fontSize: 14,
                                                         padding: { top: 10 },
                                                         scrollBeyondLastLine: false,
-                                                        readOnly: !canEditCompose,
+                                                        readOnly: !canEditCompose || (activeTab === 'env' && !envExists && envInventoryFailed),
                                                     }}
                                                 />
                                             </Suspense>

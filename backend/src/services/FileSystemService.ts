@@ -508,7 +508,14 @@ export class FileSystemService {
 
     let fh: import('fs/promises').FileHandle | null = null;
     try {
-      fh = await fsPromises.open(safePath, 'wx');
+      // O_EXCL makes creation atomic; O_NOFOLLOW closes the window where a
+      // symlink planted after the containment check is followed by the open
+      // (which would create or truncate its target). A symlink at the target
+      // surfaces as EEXIST and goes through the conflict read below.
+      fh = await fsPromises.open(
+        safePath,
+        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+      );
       await fh.writeFile(content, 'utf-8');
       await fh.close();
       fh = null;
@@ -531,17 +538,48 @@ export class FileSystemService {
           return { ok: false, currentMtimeMs: stat.mtimeMs, currentContent };
         } catch (readErr) {
           const code = (readErr as NodeJS.ErrnoException).code;
-          if (code === 'ELOOP' || code === 'ENOENT') {
-            throw Object.assign(new Error('Env target is not a readable file'), { code: 'INVALID_PATH' });
+          if (code === 'ELOOP') {
+            throw Object.assign(new Error('Env target is a symlink; refusing to follow it'), { code: 'INVALID_PATH' });
+          }
+          if (code === 'ENOENT') {
+            throw Object.assign(new Error('Env target vanished during the conflict read'), { code: 'INVALID_PATH' });
           }
           throw readErr;
         } finally {
           if (reader) await reader.close();
         }
       }
+      if ((err as NodeJS.ErrnoException).code === 'ELOOP') {
+        throw Object.assign(new Error('Env target is a symlink; refusing to follow it'), { code: 'INVALID_PATH' });
+      }
+      // The exclusive open may have created the file before the write failed
+      // (ENOSPC, EIO): remove the leftover so a retry can create again and
+      // Compose never reads a partial env file the operator never wrote. The
+      // path must still name the same file this call created (same inode and
+      // size), so a replacement by another actor is never deleted; the window
+      // between that check and the unlink is accepted (a stack-dir writer can
+      // already do worse, and leaving the file is the safe failure). Best
+      // effort, preserving the original error.
+      if (fh) {
+        let createdIno: number | null = null;
+        let createdSize = -1;
+        try {
+          const created = await fh.stat();
+          createdIno = created.ino;
+          createdSize = created.size;
+        } catch { /* ignore: still close below */ }
+        await fh.close().catch(() => {});
+        fh = null;
+        try {
+          const current = await fsPromises.lstat(safePath);
+          if (createdIno !== null && current.ino === createdIno && current.size === createdSize) {
+            await fsPromises.unlink(safePath);
+          }
+        } catch { /* best effort */ }
+      }
       throw err;
     } finally {
-      if (fh) await fh.close();
+      if (fh) await fh.close().catch(() => {});
     }
   }
 
