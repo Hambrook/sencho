@@ -504,6 +504,33 @@ describe('PUT /api/stacks/:stackName/env optimistic concurrency', () => {
     expect(fs.readFileSync(createdPath, 'utf-8')).toBe('FOO=2');
   });
 
+  it('creates a configured project env file in a missing subdirectory', async () => {
+    // The configured path can point into a subdirectory that does not exist
+    // yet; the save must create it inside the stack directory instead of
+    // falling through to an opaque 500.
+    seedStack(STACK, 'services: {}');
+    const nodeId = NodeRegistry.getInstance().getDefaultNodeId();
+    DatabaseService.getInstance().setStackProjectEnvFiles(nodeId, STACK, ['config/prod.env']);
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'PROD=1' });
+
+    expect(putRes.status).toBe(200);
+    const createdPath = path.join(composeDir, STACK, 'config', 'prod.env');
+    expect(putRes.body.envPath).toBe(createdPath);
+    expect(fs.readFileSync(createdPath, 'utf-8')).toBe('PROD=1');
+
+    const secondRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?file=${encodeURIComponent(createdPath)}`)
+      .set('Cookie', authCookie)
+      .send({ content: 'PROD=2' });
+
+    expect(secondRes.status).toBe(200);
+    expect(fs.readFileSync(createdPath, 'utf-8')).toBe('PROD=2');
+  });
+
   it('ignores force on the non-create save path', async () => {
     // force is a create-path flag: the editor's normal forced retry works by
     // omitting If-Match, so force=1 here must not bypass a stale precondition.

@@ -45,6 +45,15 @@ describe('FileSystemService.createFileExclusive', () => {
     expect(fs.readFileSync(targetPath(), 'utf-8')).toBe('FOO=1');
   });
 
+  it('creates missing parent directories inside the base', async () => {
+    const nested = path.join(composeDir, STACK_DIR, 'config', 'nested', 'prod.env');
+
+    const res = await fsService.createFileExclusive(nested, 'FOO=1');
+
+    expect(res.ok).toBe(true);
+    expect(fs.readFileSync(nested, 'utf-8')).toBe('FOO=1');
+  });
+
   it('returns the existing content instead of overwriting it', async () => {
     fs.writeFileSync(targetPath(), 'SECRET=keepme', 'utf-8');
 

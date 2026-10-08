@@ -492,6 +492,25 @@ export class FileSystemService {
    * the optimistic-concurrency path uses. The path is resolved and contained
    * like writeFileIfUnchanged.
    */
+  /**
+   * Exclusive create that also creates missing parent directories inside the
+   * compose base. A configured project env file can sit in a subdirectory that
+   * does not exist yet; the caller has already checked containment, and the
+   * retry still loses to EEXIST when another actor creates the file meanwhile.
+   */
+  private async openExclusiveCreatingParents(safePath: string): Promise<import('fs/promises').FileHandle> {
+    const createFlags =
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW;
+    try {
+      return await fsPromises.open(safePath, createFlags);
+    } catch (openErr) {
+      if ((openErr as NodeJS.ErrnoException).code !== 'ENOENT') throw openErr;
+      await fsPromises.mkdir(path.dirname(safePath), { recursive: true });
+      await this.assertRealWithinBase(safePath);
+      return fsPromises.open(safePath, createFlags);
+    }
+  }
+
   async createFileExclusive(
     untrustedTargetPath: string,
     content: string,
@@ -511,10 +530,7 @@ export class FileSystemService {
       // O_EXCL makes creation atomic; O_NOFOLLOW keeps a symlink planted after
       // the containment check from ever being followed. On Linux a symlink at
       // the target surfaces as EEXIST and goes through the conflict read below.
-      fh = await fsPromises.open(
-        safePath,
-        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
-      );
+      fh = await this.openExclusiveCreatingParents(safePath);
       await fh.writeFile(content, 'utf-8');
       await fh.close();
       fh = null;
