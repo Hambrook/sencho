@@ -927,6 +927,12 @@ stacksRouter.put('/:stackName/env', async (req: Request, res: Response) => {
       // moved path). That is a recoverable conflict, not a server fault.
       return res.status(409).json({ error: `${stackName}'s env file path is not usable` });
     }
+    if (code === 'ENOENT') {
+      // The stack directory vanished between the existence check and the
+      // write (a concurrent delete). Report the stack as gone; never recreate
+      // it, or the deleted stack would come back hidden with the env content.
+      return res.status(404).json({ error: 'Stack not found' });
+    }
     console.error('[Stacks] Failed to save env file:', error);
     res.status(500).json({ error: 'Failed to save env file' });
   }

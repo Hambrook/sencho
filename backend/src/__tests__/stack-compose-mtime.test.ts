@@ -10,13 +10,14 @@
  * These tests use real fs ops against a temp COMPOSE_DIR rather than mocks
  * because the contract is specifically about mtime semantics.
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import fs from 'fs';
 import path from 'path';
 import { setupTestDb, cleanupTestDb, loginAsTestAdmin } from './helpers/setupTestDb';
 import { DatabaseService } from '../services/DatabaseService';
 import { NodeRegistry } from '../services/NodeRegistry';
+import { FileSystemService } from '../services/FileSystemService';
 
 let tmpDir: string;
 let composeDir: string;
@@ -504,31 +505,31 @@ describe('PUT /api/stacks/:stackName/env optimistic concurrency', () => {
     expect(fs.readFileSync(createdPath, 'utf-8')).toBe('FOO=2');
   });
 
-  it('creates a configured project env file in a missing subdirectory', async () => {
-    // The configured path can point into a subdirectory that does not exist
-    // yet; the save must create it inside the stack directory instead of
-    // falling through to an opaque 500.
+  it('reports a stack directory that vanished before the create and does not recreate it', async () => {
+    // requireStackExists reads the disk, so a concurrent deleteStack can land
+    // between the check and the exclusive create. The delete is injected at
+    // the existence check itself; the real create then fails with ENOENT and
+    // the route must answer a handled 404 without recreating the directory, or
+    // the deleted stack would come back hidden holding the env content and
+    // block its name.
     seedStack(STACK, 'services: {}');
-    const nodeId = NodeRegistry.getInstance().getDefaultNodeId();
-    DatabaseService.getInstance().setStackProjectEnvFiles(nodeId, STACK, ['config/prod.env']);
+    const stackDir = path.join(composeDir, STACK);
+    const spy = vi
+      .spyOn(FileSystemService.prototype, 'hasComposeFile')
+      .mockImplementation(async () => {
+        fs.rmSync(stackDir, { recursive: true, force: true });
+        return true;
+      });
 
     const putRes = await request(app)
       .put(`/api/stacks/${STACK}/env?create=1`)
       .set('Cookie', authCookie)
-      .send({ content: 'PROD=1' });
+      .send({ content: 'FOO=1' });
 
-    expect(putRes.status).toBe(200);
-    const createdPath = path.join(composeDir, STACK, 'config', 'prod.env');
-    expect(putRes.body.envPath).toBe(createdPath);
-    expect(fs.readFileSync(createdPath, 'utf-8')).toBe('PROD=1');
-
-    const secondRes = await request(app)
-      .put(`/api/stacks/${STACK}/env?file=${encodeURIComponent(createdPath)}`)
-      .set('Cookie', authCookie)
-      .send({ content: 'PROD=2' });
-
-    expect(secondRes.status).toBe(200);
-    expect(fs.readFileSync(createdPath, 'utf-8')).toBe('PROD=2');
+    expect(putRes.status).toBe(404);
+    expect(putRes.body.error).toBe('Stack not found');
+    expect(fs.existsSync(stackDir)).toBe(false);
+    spy.mockRestore();
   });
 
   it('ignores force on the non-create save path', async () => {

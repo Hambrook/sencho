@@ -45,13 +45,17 @@ describe('FileSystemService.createFileExclusive', () => {
     expect(fs.readFileSync(targetPath(), 'utf-8')).toBe('FOO=1');
   });
 
-  it('creates missing parent directories inside the base', async () => {
-    const nested = path.join(composeDir, STACK_DIR, 'config', 'nested', 'prod.env');
+  it('refuses a target under a missing stack directory and creates nothing', async () => {
+    // A stack directory deleted between the caller's existence check and this
+    // create (a concurrent deleteStack) must not be resurrected by a recursive
+    // mkdir: the exclusive open fails with ENOENT and the route reports the
+    // stack as gone. The parent path is deliberately absent.
+    const missingStackDir = path.join(composeDir, 'gone-stack');
 
-    const res = await fsService.createFileExclusive(nested, 'FOO=1');
+    await expect(fsService.createFileExclusive(path.join(missingStackDir, '.env'), 'FOO=1'))
+      .rejects.toMatchObject({ code: 'ENOENT' });
 
-    expect(res.ok).toBe(true);
-    expect(fs.readFileSync(nested, 'utf-8')).toBe('FOO=1');
+    expect(fs.existsSync(missingStackDir)).toBe(false);
   });
 
   it('returns the existing content instead of overwriting it', async () => {
