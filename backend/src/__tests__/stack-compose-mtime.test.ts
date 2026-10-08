@@ -212,8 +212,9 @@ describe('PUT /api/stacks/:stackName/env optimistic concurrency', () => {
   it('returns a clean 404 (not a 500) when the stack has no env file yet', async () => {
     // Compose exists with no env_file directive and no .env on disk, so
     // resolveAllEnvFilePaths filters the synthesized default out and returns [],
-    // leaving the env path undefined. The save must surface a handled response
-    // rather than crashing on a write to an undefined path.
+    // leaving the env path undefined. Callers that did not ask for creation
+    // (Fleet Secrets pushes, API clients) must keep the handled response, and
+    // the guard must short-circuit before any write touches disk.
     seedStack(STACK, 'services:\n  web:\n    image: nginx\n');
 
     const putRes = await request(app)
@@ -223,8 +224,76 @@ describe('PUT /api/stacks/:stackName/env optimistic concurrency', () => {
 
     expect(putRes.status).toBe(404);
     expect(putRes.body.error).toMatch(/no env file/i);
-    // The guard must short-circuit before any write touches disk.
     expect(fs.existsSync(path.join(composeDir, STACK, '.env'))).toBe(false);
+  });
+
+  it('creates the default .env when the editor save asks for creation', async () => {
+    seedStack(STACK, 'services:\n  web:\n    image: nginx\n');
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=1' });
+
+    expect(putRes.status).toBe(200);
+    expect(putRes.body.created).toBe(true);
+    const createdPath = putRes.body.envPath as string;
+    expect(createdPath).toBe(path.join(composeDir, STACK, '.env'));
+    expect(putRes.headers.etag).toMatch(/^W\/"\d+"$/);
+    expect(fs.readFileSync(createdPath, 'utf-8')).toBe('FOO=1');
+  });
+
+  it('saves again through the canonical path returned by the create response', async () => {
+    // The editor selects the created file from the create response and echoes
+    // it as ?file= on the next save. That path must be accepted, otherwise the
+    // very next save fails with "Requested env file not allowed".
+    seedStack(STACK, 'services:\n  web:\n    image: nginx\n');
+
+    const createRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=1' });
+
+    const createdPath = createRes.body.envPath as string;
+    const etag = createRes.headers.etag as string;
+
+    const secondRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?file=${encodeURIComponent(createdPath)}`)
+      .set('Cookie', authCookie)
+      .set('If-Match', etag)
+      .send({ content: 'FOO=2' });
+
+    expect(secondRes.status).toBe(200);
+    expect(fs.readFileSync(createdPath, 'utf-8')).toBe('FOO=2');
+  });
+
+  it('returns 404 for a create save on a stack that does not exist', async () => {
+    // The create branch validates stack existence before the write: a missing
+    // stack must not fabricate a directory (or surface as an ENOENT 500).
+    const missing = 'ghost-stack';
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${missing}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=1' });
+
+    expect(putRes.status).toBe(404);
+    expect(putRes.body.error).toMatch(/not found/i);
+    expect(fs.existsSync(path.join(composeDir, missing))).toBe(false);
+  });
+
+  it('writes the existing env file normally when create is set on a stack that has one', async () => {
+    seedStack(STACK, 'services: {}');
+    const envPath = seedEnv(STACK, 'FOO=1');
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=2' });
+
+    expect(putRes.status).toBe(200);
+    expect(putRes.body.created).toBeUndefined();
+    expect(fs.readFileSync(envPath, 'utf-8')).toBe('FOO=2');
   });
 
   it('returns 412 on env-file mtime mismatch', async () => {

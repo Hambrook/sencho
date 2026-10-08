@@ -828,11 +828,18 @@ stacksRouter.put('/:stackName/env', async (req: Request, res: Response) => {
       }
     }
 
-    // No env file resolved: the stack has no .env yet. Allow creating the default .env file.
+    // No env file resolved: the stack has no env file yet. The editor unlocks the
+    // .env tab in that state and creates the default .env on first save, which it
+    // marks with ?create=1. Every other caller keeps the handled 404 so pushing a
+    // secret bundle to a stack with no env file never creates one as a side effect.
+    let created = false;
     if (!envPath) {
-      const fsService = FileSystemService.getInstance(req.nodeId);
-      const stackDir = path.join(fsService.getBaseDir(), stackName);
-      envPath = path.join(stackDir, '.env');
+      if (req.query.create !== '1') {
+        return res.status(404).json({ error: 'No env file exists for this stack' });
+      }
+      if (!(await requireStackExists(req.nodeId, stackName, res))) return;
+      envPath = path.join(FileSystemService.getInstance(req.nodeId).getBaseDir(), stackName, '.env');
+      created = true;
     }
 
     const fsService = FileSystemService.getInstance(req.nodeId);
@@ -850,9 +857,15 @@ stacksRouter.put('/:stackName/env', async (req: Request, res: Response) => {
     invalidateNodeCaches(req.nodeId);
     StackFileRootsService.invalidate(req.nodeId, stackName);
     const envFileName = path.basename(envPath);
-    dlog(`[Stacks] Env file saved: ${sanitizeForLog(stackName)}/${sanitizeForLog(envFileName)}`);
+    dlog(`[Stacks] Env file saved: ${sanitizeForLog(stackName)}/${sanitizeForLog(envFileName)}${created ? ' (created)' : ''}`);
     res.setHeader('ETag', stackFileEtag(result.mtimeMs));
-    res.json({ message: 'Env file saved successfully', mtimeMs: result.mtimeMs });
+    res.json({
+      message: 'Env file saved successfully',
+      mtimeMs: result.mtimeMs,
+      // Create path only: the client needs the resolved path to select the new
+      // file on its next read/save without a second round trip.
+      ...(created ? { created: true, envPath } : {}),
+    });
   } catch (error) {
     console.error('[Stacks] Failed to save env file:', error);
     res.status(500).json({ error: 'Failed to save env file' });

@@ -59,6 +59,7 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
         setEnvContent,
         activeTab,
         setActiveTab,
+        envExists,
         envFiles,
         selectedEnvFile,
         changeEnvFile,
@@ -77,17 +78,18 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
 
     // The save handlers (saveFile) key off the shared editorState.activeTab, so the
     // displayed buffer must match it. The desktop editor can hand off a 'files' tab
-    // (or 'env' with no env file) when it crosses into the mobile breakpoint; left
-    // alone the textarea would show compose while a save silently no-ops on 'files'.
-    // Normalize to 'compose' so the visible edit always saves to the visible file.
+    // when it crosses into the mobile breakpoint; left alone the textarea would
+    // show compose while a save silently no-ops on 'files'. Normalize to 'compose'
+    // so the visible edit always saves to the visible file.
     useEffect(() => {
         if (activeTab === 'files') {
             setActiveTab('compose');
         }
     }, [activeTab, setActiveTab]);
 
-    // Allow env tab even if env doesn't exist
-    const tab: 'compose' | 'env' = activeTab === 'env' ? 'env' : activeTab === 'compose' ? 'compose' : 'compose';
+    // The .env tab stays available without an env file: its first save creates
+    // the default .env, same as the desktop editor.
+    const tab: 'compose' | 'env' = activeTab === 'env' ? 'env' : 'compose';
     const value = tab === 'compose' ? content || '' : envContent || '';
     // Switching the env file refetches and overwrites the env buffer, so block it
     // while there are unsaved edits (matches the desktop selector being disabled
@@ -162,6 +164,11 @@ export function MobileComposeEditor(props: MobileComposeEditorProps) {
                     </Select>
                 )}
             </div>
+            {tab === 'env' && !envExists && canEdit && (
+                <p className="shrink-0 border-b border-hairline bg-brand/8 px-4 py-2 font-mono text-[11px] leading-snug text-brand">
+                    This stack has no environment file yet. A .env file will be created in the stack directory when you save.
+                </p>
+            )}
             {/* Editor */}
             <div className="min-h-0 flex-1 overflow-hidden p-3">
                 <textarea

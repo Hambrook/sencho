@@ -1237,9 +1237,15 @@ export function useStackActions(options: UseStackActionsOptions) {
     const currentContent = isCompose
       ? editorState.content || ''
       : editorState.envContent || '';
+    // The env tab opens before an env file exists. Its first save asks the
+    // backend to create the default .env and returns the resolved path, which
+    // becomes the selected file so later saves target it directly.
+    const creatingEnv = !isCompose && !editorState.envExists;
     const endpoint = isCompose
       ? `/stacks/${stackListState.selectedFile}`
-      : `/stacks/${stackListState.selectedFile}/env?file=${encodeURIComponent(editorState.selectedEnvFile)}`;
+      : creatingEnv
+        ? `/stacks/${stackListState.selectedFile}/env?create=1`
+        : `/stacks/${stackListState.selectedFile}/env?file=${encodeURIComponent(editorState.selectedEnvFile)}`;
     const etag = isCompose ? editorState.composeEtag : editorState.envEtag;
     const headers: Record<string, string> = {};
     if (!force && etag) headers['If-Match'] = etag;
@@ -1289,11 +1295,28 @@ export function useStackActions(options: UseStackActionsOptions) {
       } else {
         editorState.setOriginalEnvContent(editorState.envContent);
         if (newEtag) editorState.setEnvEtag(newEtag);
-        // If we just created a new env file, mark it as existing
-        editorState.setEnvExists(true);
-        const sel = editorState.selectedEnvFile || '.env';
-        editorState.setSelectedEnvFile(sel);
-        editorState.setEnvFiles([sel]);
+        if (creatingEnv) {
+          // Create path only: adopt the resolved path the backend returns so
+          // the next save targets the created file instead of failing the
+          // allowed-file check with a relative name.
+          const payload = (await response.json().catch(() => null)) as
+            { created?: unknown; envPath?: unknown } | null;
+          const createdPath =
+            payload && payload.created === true && typeof payload.envPath === 'string'
+              ? payload.envPath
+              : '';
+          if (createdPath) {
+            editorState.setEnvExists(true);
+            editorState.setSelectedEnvFile(createdPath);
+            editorState.setEnvFiles([createdPath]);
+          } else {
+            // A 200 without the resolved path is unexpected (a proxy mangling the
+            // body). The next save still resolves server-side because the create
+            // flag is ignored once an env file exists, so surface it only as a
+            // diagnostic rather than a failed save.
+            console.warn('[Editor] Env create response did not include the resolved path');
+          }
+        }
       }
       toast.success('File saved successfully!');
       return true;

@@ -65,6 +65,7 @@ function makeEditorState(over: Partial<EditorState> = {}): EditorState {
     setEnvFiles: vi.fn(),
     setSelectedEnvFile: vi.fn(),
     setEnvExists: vi.fn(),
+    envExists: true,
     setBackupInfo: vi.fn(),
     setIsFileLoading: vi.fn(),
     setGitSourcePendingMap: vi.fn(),
@@ -248,6 +249,55 @@ describe('useStackActions.saveFile', () => {
     const ok = await result.current.saveFile();
     expect(ok).toBe(false);
     expect(apiFetch).not.toHaveBeenCalled();
+  });
+
+  it('asks the backend to create the default .env when the env tab has no file', async () => {
+    vi.mocked(apiFetch).mockResolvedValue(
+      okJson({ message: 'Env file saved successfully', mtimeMs: 123, created: true, envPath: '/compose/web/.env' }),
+    );
+    const { result, editorState } = setup({
+      editorState: {
+        activeTab: 'env',
+        envExists: false,
+        selectedEnvFile: '',
+        envContent: 'FOO=1',
+        originalEnvContent: '',
+      },
+    });
+
+    const ok = await result.current.saveFile();
+
+    expect(ok).toBe(true);
+    const call = vi.mocked(apiFetch).mock.calls.find(
+      c => String(c[0]).includes('/stacks/web.yml/env') && (c[1] as RequestInit | undefined)?.method === 'PUT',
+    );
+    expect(String(call?.[0])).toBe('/stacks/web.yml/env?create=1');
+    expect(editorState.setOriginalEnvContent).toHaveBeenCalledWith('FOO=1');
+    expect(editorState.setEnvExists).toHaveBeenCalledWith(true);
+    expect(editorState.setSelectedEnvFile).toHaveBeenCalledWith('/compose/web/.env');
+    expect(editorState.setEnvFiles).toHaveBeenCalledWith(['/compose/web/.env']);
+  });
+
+  it('saves an existing env file through its selected path without the create flag', async () => {
+    vi.mocked(apiFetch).mockResolvedValue(new Response(null, { status: 200 }));
+    const { result } = setup({
+      editorState: {
+        activeTab: 'env',
+        envExists: true,
+        selectedEnvFile: '/compose/web/.env',
+        envContent: 'FOO=2',
+        originalEnvContent: 'FOO=1',
+      },
+    });
+
+    const ok = await result.current.saveFile();
+
+    expect(ok).toBe(true);
+    const call = vi.mocked(apiFetch).mock.calls.find(
+      c => String(c[0]).includes('/stacks/web.yml/env') && (c[1] as RequestInit | undefined)?.method === 'PUT',
+    );
+    expect(String(call?.[0])).toBe(`/stacks/web.yml/env?file=${encodeURIComponent('/compose/web/.env')}`);
+    expect(String(call?.[0])).not.toContain('create=1');
   });
 });
 

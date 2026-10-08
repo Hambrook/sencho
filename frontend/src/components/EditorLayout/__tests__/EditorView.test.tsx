@@ -236,6 +236,45 @@ describe('EditorView single edit gate', () => {
   });
 });
 
+describe('EditorView env creation affordance', () => {
+  afterEach(() => {
+    lastLanguage = undefined;
+    lastValue = undefined;
+    lastReadOnly = undefined;
+  });
+
+  it('keeps the .env tab enabled without an env file and explains the creation', () => {
+    render(<EditorView {...makeProps({ editingCompose: true, activeTab: 'env', envExists: false })} />);
+    expect(screen.getByRole('tab', { name: '.env' })).toBeEnabled();
+    expect(
+      screen.getByText(/will be created in the stack directory when you save/),
+    ).toBeInTheDocument();
+  });
+
+  it('hides the creation notice when the stack already has an env file', () => {
+    render(<EditorView {...makeProps({ editingCompose: true, activeTab: 'env', envExists: true })} />);
+    expect(
+      screen.queryByText(/will be created in the stack directory when you save/),
+    ).not.toBeInTheDocument();
+  });
+
+  it('hides the creation notice for a user who cannot edit the stack', () => {
+    render(
+      <EditorView
+        {...makeProps({
+          editingCompose: true,
+          activeTab: 'env',
+          envExists: false,
+          can: () => false,
+        })}
+      />,
+    );
+    expect(
+      screen.queryByText(/will be created in the stack directory when you save/),
+    ).not.toBeInTheDocument();
+  });
+});
+
 describe('EditorView image pull affordance', () => {
   /** Opens the save dropdown attached to Save & Deploy. The trigger is the
    *  chevron Radix marks with aria-haspopup, which is the only stable handle:
