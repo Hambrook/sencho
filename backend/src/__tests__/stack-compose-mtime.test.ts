@@ -399,6 +399,26 @@ describe('PUT /api/stacks/:stackName/env optimistic concurrency', () => {
     expect(fs.readFileSync(outsidePath, 'utf-8')).toBe('OUTSIDE=secret');
   });
 
+  it('answers 409 for an in-root symlinked .env instead of an opaque 500', async () => {
+    // The resolver sees the link as present; the exclusive create refuses to
+    // follow it and the route maps the path error to 409.
+    seedStack(STACK, 'services: {}');
+    const realPath = path.join(composeDir, STACK, 'real.env');
+    const linkPath = path.join(composeDir, STACK, '.env');
+    fs.writeFileSync(realPath, 'REAL=1', 'utf-8');
+    fs.symlinkSync(realPath, linkPath);
+
+    const putRes = await request(app)
+      .put(`/api/stacks/${STACK}/env?create=1`)
+      .set('Cookie', authCookie)
+      .send({ content: 'FOO=1' });
+
+    expect(putRes.status).toBe(409);
+    expect(putRes.body.currentContent).toBeUndefined();
+    expect(fs.readFileSync(realPath, 'utf-8')).toBe('REAL=1');
+    expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+  });
+
   it('answers 409 when the default env path is a dangling symlink', async () => {
     seedStack(STACK, 'services: {}');
     const linkPath = path.join(composeDir, STACK, '.env');

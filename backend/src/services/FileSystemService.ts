@@ -508,10 +508,9 @@ export class FileSystemService {
 
     let fh: import('fs/promises').FileHandle | null = null;
     try {
-      // O_EXCL makes creation atomic; O_NOFOLLOW closes the window where a
-      // symlink planted after the containment check is followed by the open
-      // (which would create or truncate its target). A symlink at the target
-      // surfaces as EEXIST and goes through the conflict read below.
+      // O_EXCL makes creation atomic; O_NOFOLLOW keeps a symlink planted after
+      // the containment check from ever being followed. On Linux a symlink at
+      // the target surfaces as EEXIST and goes through the conflict read below.
       fh = await fsPromises.open(
         safePath,
         fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,

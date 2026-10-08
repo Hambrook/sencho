@@ -632,9 +632,22 @@ describe('useStackActions.saveFile', () => {
     expect(String(call?.[0])).toBe('/stacks/web.yml/env?create=1&force=1');
   });
 
-  it('leaves the create state unchanged when a 200 has no resolved path', async () => {
-    vi.mocked(apiFetch).mockResolvedValue(okJson({ message: 'Env file saved successfully', mtimeMs: 123 }));
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  it('leaves create mode after an older node accepts the overwrite without naming the path', async () => {
+    // Sequence on a node that predates the envPath response: create -> 412
+    // without a path -> confirm -> forced retry -> 200 without a path. The
+    // editor must refresh the inventory so later saves are normal conditional
+    // writes instead of prompting for an overwrite every time.
+    const conflict = new Response(
+      JSON.stringify({ currentContent: 'SECRET=keepme', code: 'stack_file_changed' }),
+      { status: 412, headers: { 'Content-Type': 'application/json', ETag: 'W/"111"' } },
+    );
+    vi.mocked(apiFetch)
+      .mockResolvedValueOnce(conflict)
+      .mockResolvedValueOnce(okJson({ message: 'Env file saved successfully', mtimeMs: 222 }))
+      .mockResolvedValueOnce(okJson({ envFiles: ['/compose/web/.env'] }))
+      .mockResolvedValueOnce(new Response('SECRET=keepme', { status: 200, headers: { ETag: 'W/"222"' } }))
+      .mockResolvedValueOnce(new Response(null, { status: 200, headers: { ETag: 'W/"333"' } }));
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     try {
       const { result, editorState } = setup({
         editorState: {
@@ -645,14 +658,33 @@ describe('useStackActions.saveFile', () => {
           originalEnvContent: '',
         },
       });
+      // Mirror the real state for the follow-up save: these setters mutate the
+      // stub so the next saveFile call observes the adopted file.
+      const mutable = editorState as unknown as Record<string, unknown>;
+      mutable.setEnvExists = vi.fn((v: unknown) => { mutable.envExists = v; });
+      mutable.setSelectedEnvFile = vi.fn((v: unknown) => { mutable.selectedEnvFile = v; });
+      mutable.setEnvEtag = vi.fn((v: unknown) => { mutable.envEtag = v; });
 
-      const ok = await result.current.saveFile();
+      const first = await result.current.saveFile();
 
-      expect(ok).toBe(true);
-      expect(editorState.setEnvExists).not.toHaveBeenCalled();
-      expect(warnSpy).toHaveBeenCalled();
+      expect(first).toBe(true);
+      const envsCalls = vi.mocked(apiFetch).mock.calls.filter(c => String(c[0]) === '/stacks/web.yml/envs');
+      expect(envsCalls).toHaveLength(1);
+      expect(editorState.setEnvExists).toHaveBeenCalledWith(true);
+      expect(editorState.setSelectedEnvFile).toHaveBeenCalledWith('/compose/web/.env');
+
+      // The next save is a normal conditional write with the refreshed ETag.
+      const second = await result.current.saveFile();
+
+      expect(second).toBe(true);
+      const puts = vi.mocked(apiFetch).mock.calls.filter(
+        c => String(c[0]).includes('/stacks/web.yml/env') && (c[1] as RequestInit | undefined)?.method === 'PUT',
+      );
+      expect(String(puts[2]?.[0])).toBe(`/stacks/web.yml/env?file=${encodeURIComponent('/compose/web/.env')}`);
+      expect((puts[2]?.[1] as RequestInit | undefined)?.headers).toMatchObject({ 'If-Match': 'W/"222"' });
+      expect(String(puts[2]?.[0])).not.toContain('create=1');
     } finally {
-      warnSpy.mockRestore();
+      confirmSpy.mockRestore();
     }
   });
 });
@@ -686,7 +718,7 @@ describe('useStackActions.handleSaveAndDeploy', () => {
   });
 
   it('proceeds to deploy without an env PUT on an untouched empty env tab', async () => {
-    // SF-2: Save & Deploy on the still-empty env tab must not plant an empty
+    // Save & Deploy on the still-empty env tab must not plant an empty
     // .env; the deploy still runs.
     vi.mocked(apiFetch).mockResolvedValueOnce(new Response(null, { status: 200 })); // deploy OK
     vi.mocked(apiFetch).mockResolvedValueOnce(new Response('[]', { status: 200 })); // containers refresh

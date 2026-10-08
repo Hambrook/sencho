@@ -918,8 +918,14 @@ stacksRouter.put('/:stackName/env', async (req: Request, res: Response) => {
     res.setHeader('ETag', stackFileEtag(result.mtimeMs));
     res.json({ message: 'Env file saved successfully', mtimeMs: result.mtimeMs });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EISDIR') {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EISDIR') {
       return res.status(409).json({ error: `${stackName}'s env file path is a directory` });
+    }
+    if (code === 'INVALID_PATH' || code === 'SYMLINK_ESCAPE') {
+      // The target became unusable between resolution and write (symlink,
+      // moved path). That is a recoverable conflict, not a server fault.
+      return res.status(409).json({ error: `${stackName}'s env file path is not usable` });
     }
     console.error('[Stacks] Failed to save env file:', error);
     res.status(500).json({ error: 'Failed to save env file' });

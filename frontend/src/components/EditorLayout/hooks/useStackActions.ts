@@ -1299,6 +1299,10 @@ export function useStackActions(options: UseStackActionsOptions) {
     // A forced retry re-enters this same closure and reads the same already
     // captured `activeNode` binding, so both PUTs carry one target.
     const opNodeId = activeNode?.id ?? null;
+    // The load that produced the current editor state, captured before the PUT:
+    // a stack switch during the request aborts it, so post-save recovery can
+    // tell that the editor moved on and must not repaint.
+    const opLoadSignal = loadFileAbortRef.current?.signal;
     try {
       const response = await apiFetch(endpoint, {
         method: 'PUT',
@@ -1342,19 +1346,19 @@ export function useStackActions(options: UseStackActionsOptions) {
           // the file, and such a node's route resolves the default env source,
           // so the retry cannot pin a path. Keep the 412 content visible, then
           // refresh the inventory so the tab stops offering to create one. The
-          // refresh runs under the current load's signal; if a stack switch
-          // aborts it, the new load owns the state and nothing more is painted.
+          // refresh runs under the signal captured before the PUT; if a stack
+          // switch aborts it, the new load owns the state and nothing more is
+          // painted.
           editorState.setEnvContent(currentRemoteContent);
           editorState.setOriginalEnvContent(currentRemoteContent);
           editorState.setEnvEtag(response.headers.get('etag'));
-          const refreshSignal = loadFileAbortRef.current?.signal;
-          const refreshed = await loadEnvState(stackListState.selectedFile, refreshSignal, opNodeId);
-          if (refreshSignal?.aborted) return false;
+          const refreshed = await loadEnvState(stackListState.selectedFile, opLoadSignal, opNodeId);
+          if (opLoadSignal?.aborted) return false;
           if (!refreshed.ok) {
             // The refresh did not complete (or loaded no content). The buffer
-            // still holds the conflicted file's content and the adopted ETag
-            // guards the next save, so report the failure instead of claiming
-            // a reload.
+            // still holds the conflicted file's content; the unknown-state
+            // guard refuses the next save, so report the failure instead of
+            // claiming a reload.
             editorState.setEnvContent(currentRemoteContent);
             editorState.setOriginalEnvContent(currentRemoteContent);
             editorState.setEnvEtag(response.headers.get('etag'));
@@ -1392,10 +1396,15 @@ export function useStackActions(options: UseStackActionsOptions) {
             editorState.setSelectedEnvFile(createdPath);
             editorState.setEnvFiles([createdPath]);
           } else {
-            // A 200 without the resolved path is unexpected. The next save still
-            // cannot overwrite anything: the server treats create=1 as exclusive
-            // and answers 412 when a file exists.
-            console.warn('[Editor] Env create response did not include the resolved path');
+            // A node that predates the envPath response accepted the write but
+            // cannot name the path. Refresh the inventory so the editor leaves
+            // create mode and later saves are normal conditional writes instead
+            // of prompting for an overwrite on every save.
+            const refreshed = await loadEnvState(stackListState.selectedFile, opLoadSignal, opNodeId);
+            if (opLoadSignal?.aborted) return true;
+            if (!refreshed.ok) {
+              toast.error('Saved, but the environment files could not be reloaded. Reload the editor before the next save.');
+            }
           }
         }
       }
