@@ -245,9 +245,9 @@ export interface StackEnvFileState {
   /** Present env files the editor can edit: injection sources first, deduped. */
   existing: string[];
   /**
-   * The interpolation source Compose reads (the first configured project env
-   * file, else the default `.env`), present or missing. Null only when no
-   * configured path resolves inside the stack directory.
+   * The interpolation source Compose reads: the first configured project env
+   * file that resolves inside the stack directory, else the default `.env`.
+   * Present or missing; null only when none qualifies.
    */
   createTarget: string | null;
 }

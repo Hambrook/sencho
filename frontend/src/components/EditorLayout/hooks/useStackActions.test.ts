@@ -687,6 +687,112 @@ describe('useStackActions.saveFile', () => {
       confirmSpy.mockRestore();
     }
   });
+
+  it('does not adopt a create response that lands after a stack switch', async () => {
+    // Stack A's load owns the controller the save captures; switching to B
+    // aborts it while A's PUT is still in flight, so the late success response
+    // must not paint A's file state into B's editor.
+    let resolveComposeA!: (r: Response) => void;
+    const composeA = new Promise<Response>((resolve) => { resolveComposeA = resolve; });
+    let resolvePut!: (r: Response) => void;
+    const put = new Promise<Response>((resolve) => { resolvePut = resolve; });
+    vi.mocked(apiFetch).mockImplementation((url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u === '/stacks/a.yml' && method === 'GET') return composeA;
+      if (u === '/stacks/a.yml/env?create=1' && method === 'PUT') return put;
+      if (u === '/stacks/b.yml' && method === 'GET') return Promise.resolve(new Response('services: {}', { status: 200 }));
+      if (u.endsWith('/envs')) return Promise.resolve(new Response(JSON.stringify({ envFiles: [] }), { status: 200 }));
+      if (u.includes('/containers')) return Promise.resolve(new Response('[]', { status: 200 }));
+      if (u.endsWith('/backup')) return Promise.resolve(new Response(JSON.stringify({ exists: false }), { status: 200 }));
+      if (u.endsWith('/effective-services')) {
+        return Promise.resolve(new Response(JSON.stringify({ renderable: false, services: [] }), { status: 200 }));
+      }
+      return Promise.resolve(new Response('', { status: 404 }));
+    });
+    const { result, editorState } = setup({
+      editorState: {
+        content: 'same',
+        originalContent: 'same',
+        activeTab: 'env',
+        envExists: false,
+        selectedEnvFile: '',
+        envContent: 'FOO=1',
+        originalEnvContent: '',
+      },
+      stackList: { selectedFile: 'a.yml' },
+    });
+
+    const loadA = result.current.loadFile('a.yml');
+    const savePromise = result.current.saveFile();
+    await result.current.loadFile('b.yml', { skipUnsavedCheck: true });
+
+    resolvePut(okJson({ message: 'Env file saved successfully', mtimeMs: 1, created: true, envPath: '/compose/a/.env' }));
+    const saved = await savePromise;
+
+    expect(saved).toBe(true);
+    expect(editorState.setEnvExists).not.toHaveBeenCalledWith(true);
+    expect(editorState.setSelectedEnvFile).not.toHaveBeenCalledWith('/compose/a/.env');
+    expect(editorState.setEnvFiles).not.toHaveBeenCalledWith(['/compose/a/.env']);
+    resolveComposeA(new Response('services: {}', { status: 200 }));
+    await loadA;
+  });
+
+  it('does not prompt for a create conflict that lands after a stack switch', async () => {
+    let resolveComposeA!: (r: Response) => void;
+    const composeA = new Promise<Response>((resolve) => { resolveComposeA = resolve; });
+    let resolvePut!: (r: Response) => void;
+    const put = new Promise<Response>((resolve) => { resolvePut = resolve; });
+    vi.mocked(apiFetch).mockImplementation((url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u === '/stacks/a.yml' && method === 'GET') return composeA;
+      if (u === '/stacks/a.yml/env?create=1' && method === 'PUT') return put;
+      if (u === '/stacks/b.yml' && method === 'GET') return Promise.resolve(new Response('services: {}', { status: 200 }));
+      if (u.endsWith('/envs')) return Promise.resolve(new Response(JSON.stringify({ envFiles: [] }), { status: 200 }));
+      if (u.includes('/containers')) return Promise.resolve(new Response('[]', { status: 200 }));
+      if (u.endsWith('/backup')) return Promise.resolve(new Response(JSON.stringify({ exists: false }), { status: 200 }));
+      if (u.endsWith('/effective-services')) {
+        return Promise.resolve(new Response(JSON.stringify({ renderable: false, services: [] }), { status: 200 }));
+      }
+      return Promise.resolve(new Response('', { status: 404 }));
+    });
+    const { result, editorState } = setup({
+      editorState: {
+        content: 'same',
+        originalContent: 'same',
+        activeTab: 'env',
+        envExists: false,
+        selectedEnvFile: '',
+        envContent: 'FOO=1',
+        originalEnvContent: '',
+      },
+      stackList: { selectedFile: 'a.yml' },
+    });
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    try {
+      const loadA = result.current.loadFile('a.yml');
+      const savePromise = result.current.saveFile();
+      await result.current.loadFile('b.yml', { skipUnsavedCheck: true });
+
+      resolvePut(
+        new Response(
+          JSON.stringify({ currentContent: 'SECRET=keepme', code: 'stack_file_changed', envPath: '/compose/a/.env' }),
+          { status: 412, headers: { 'Content-Type': 'application/json', ETag: 'W/"111"' } },
+        ),
+      );
+      const saved = await savePromise;
+
+      expect(saved).toBe(false);
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(editorState.setEnvExists).not.toHaveBeenCalledWith(true);
+      expect(editorState.setSelectedEnvFile).not.toHaveBeenCalledWith('/compose/a/.env');
+      resolveComposeA(new Response('services: {}', { status: 200 }));
+      await loadA;
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
 });
 
 // Shared by the save-then-deploy and save-then-pull blocks: both assert on the

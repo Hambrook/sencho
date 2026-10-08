@@ -1316,6 +1316,11 @@ export function useStackActions(options: UseStackActionsOptions) {
           payload && typeof payload.currentContent === 'string' ? payload.currentContent : '';
         const conflictPath =
           payload && typeof payload.envPath === 'string' ? payload.envPath : '';
+        // The response belongs to a stack the editor has left: a new load
+        // aborted this one's signal and owns the state now. Do not paint the
+        // old stack's file into it, and do not prompt for a conflict the
+        // operator is no longer looking at.
+        if (opLoadSignal?.aborted) return false;
         // A create conflict means the file appeared after the tab loaded. Adopt
         // it and its ETag so the notice clears, later saves target the real
         // file, and a forced retry that fails cannot fall back to an unguarded
@@ -1376,6 +1381,10 @@ export function useStackActions(options: UseStackActionsOptions) {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${await response.text()}`);
       }
+      // If the editor moved to another stack while the PUT was in flight, the
+      // new load owns the state: the write succeeded, but none of this
+      // response's file state may be painted into the editor.
+      if (opLoadSignal?.aborted) return true;
       const newEtag = response.headers.get('etag');
       if (isCompose) {
         editorState.setOriginalContent(editorState.content);
